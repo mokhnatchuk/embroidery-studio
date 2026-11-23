@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Embroidery Studio
+Comment=Cross-stitch embroidery editor
+Exec=embroidery-studio %F
+Terminal=false
+Categories=Graphics;2DGraphics;
+MimeType=application/x-embroidery-jef;application/x-embroidery-pes;application/x-embroidery-dst;
