@@ -850,8 +850,8 @@ static void write_jef_hoop_margin_group(
     }
 }
 
-/* Select Janome Memory Craft 550E hoop code from design extents in 0.1 mm. */
-static uint32_t select_janome_550e_hoop_code(
+/* Select standard JEF hoop code from design extents in 0.1 mm. */
+static uint32_t select_jef_hoop_code(
     int32_t extent_left,
     int32_t extent_top,
     int32_t extent_right,
@@ -872,7 +872,7 @@ static uint32_t select_janome_550e_hoop_code(
     if (extent_left <= 1000 && extent_right <= 1000 && extent_top <= 1000 && extent_bottom <= 1000) {
         return 4U;
     }
-    /* Extended Janome MC500E/550E hoop code for RE28b (200x280) and RE36b (200x360). */
+    /* Extended JEF hoop code for large hoops (200x280 mm and 200x360 mm). */
     return 38U;
 }
 
@@ -1067,7 +1067,7 @@ bool write_jef_file(const StitchDesign *design, const char *output_path) {
     }
 
     const uint32_t hoop_code =
-        select_janome_550e_hoop_code(extent_left, extent_top, extent_right, extent_bottom);
+        select_jef_hoop_code(extent_left, extent_top, extent_right, extent_bottom);
 
     int64_t needle_x = 0LL;
     int64_t needle_y = 0LL;
