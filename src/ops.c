@@ -626,6 +626,396 @@ static void insert_chain_diagonals_into_clusters(
     }
 }
 
+void cross_cluster_cache_init(CrossClusterCache *cache) {
+    *cache = (CrossClusterCache){};
+}
+
+void cross_cluster_cache_free(CrossClusterCache *cache) {
+    free(cache->cluster_center_x);
+    free(cache->cluster_center_y);
+    free(cache->cluster_keep_flags);
+    free(cache->segment_cluster_id);
+    *cache = (CrossClusterCache){};
+}
+
+void cross_cluster_cache_invalidate(CrossClusterCache *cache) {
+    cache->valid = false;
+}
+
+bool cross_cluster_cache_build(
+    CrossClusterCache *cache,
+    const StitchDesign *design,
+    int32_t pitch_units,
+    ScratchArena *scratch
+) {
+    bool succeeded = false;
+    ScratchArena local_scratch = {};
+    ScratchArena *active_scratch = scratch;
+    if (active_scratch == nullptr) {
+        scratch_arena_init(&local_scratch);
+        active_scratch = &local_scratch;
+    }
+
+    cross_cluster_cache_free(cache);
+
+    int32_t pitch = pitch_units;
+    if (pitch < MIN_CROSS_PITCH_UNITS) {
+        pitch = DEFAULT_CROSS_PITCH_UNITS;
+    }
+    cache->pitch_units = pitch;
+    cache->built_revision = design->geometry_revision;
+
+    size_t total_segments = 0U;
+    size_t diagonal_count = 0U;
+    for (size_t chain_index = 0U; chain_index < design->chain_count; chain_index += 1U) {
+        const StitchChain chain = design->chains[chain_index];
+        if (chain.point_count < 2U) {
+            continue;
+        }
+        const size_t chain_segments = chain.point_count - 1U;
+        total_segments += chain_segments;
+        if (chain.color_block_index >= design->block_count ||
+            !design->blocks[chain.color_block_index].enabled) {
+            continue;
+        }
+        const StitchPoint *chain_points = &design->points[chain.point_offset];
+        for (size_t local_index = 0U; local_index < chain_segments; local_index += 1U) {
+            if (is_cross_diagonal_for_pitch(chain_points[local_index], chain_points[local_index + 1U], pitch)) {
+                diagonal_count += 1U;
+            }
+        }
+    }
+
+    cache->total_segments = total_segments;
+    if (total_segments == 0U) {
+        cache->valid = true;
+        succeeded = true;
+        goto cleanup;
+    }
+
+    size_t seg_id_bytes = 0U;
+    if (ckd_mul(&seg_id_bytes, total_segments, sizeof(int32_t))) {
+        goto cleanup;
+    }
+    cache->segment_cluster_id = (int32_t *)malloc(seg_id_bytes);
+    if (cache->segment_cluster_id == nullptr) {
+        goto cleanup;
+    }
+    for (size_t segment_index = 0U; segment_index < total_segments; segment_index += 1U) {
+        cache->segment_cluster_id[segment_index] = -1;
+    }
+
+    if (diagonal_count == 0U) {
+        cache->valid = true;
+        succeeded = true;
+        goto cleanup;
+    }
+
+    const size_t bucket_count = compute_power_of_two_buckets(diagonal_count, 1048576U);
+    const size_t bucket_mask = bucket_count - 1U;
+    size_t scratch_bytes = 0U;
+    if (!scratch_arena_add_slice_bytes(&scratch_bytes, diagonal_count, sizeof(CrossCluster)) ||
+        !scratch_arena_add_slice_bytes(&scratch_bytes, diagonal_count, sizeof(CrossClusterNode)) ||
+        !scratch_arena_add_slice_bytes(&scratch_bytes, bucket_count, sizeof(int32_t)) ||
+        !scratch_arena_prepare(active_scratch, scratch_bytes)) {
+        goto cleanup;
+    }
+
+    CrossCluster *clusters =
+        (CrossCluster *)scratch_arena_push(active_scratch, diagonal_count, sizeof(CrossCluster));
+    CrossClusterNode *cluster_nodes =
+        (CrossClusterNode *)scratch_arena_push(active_scratch, diagonal_count, sizeof(CrossClusterNode));
+    int32_t *bucket_heads =
+        (int32_t *)scratch_arena_push(active_scratch, bucket_count, sizeof(int32_t));
+    if (clusters == nullptr || cluster_nodes == nullptr || bucket_heads == nullptr) {
+        goto cleanup;
+    }
+    memset(clusters, 0, diagonal_count * sizeof(CrossCluster));
+    memset(cluster_nodes, 0, diagonal_count * sizeof(CrossClusterNode));
+    for (size_t bucket_index = 0U; bucket_index < bucket_count; bucket_index += 1U) {
+        bucket_heads[bucket_index] = -1;
+    }
+
+    size_t cluster_count = 0U;
+    for (size_t chain_index = 0U; chain_index < design->chain_count; chain_index += 1U) {
+        const StitchChain chain = design->chains[chain_index];
+        if (chain.color_block_index >= design->block_count ||
+            !design->blocks[chain.color_block_index].enabled ||
+            chain.point_count < 2U) {
+            continue;
+        }
+        insert_chain_diagonals_into_clusters(
+            &design->points[chain.point_offset],
+            chain.point_count,
+            design->blocks[chain.color_block_index].janome_color_index,
+            pitch,
+            bucket_mask,
+            bucket_heads,
+            cluster_nodes,
+            clusters,
+            diagonal_count,
+            &cluster_count
+        );
+    }
+
+    if (cluster_count > 0U) {
+        size_t coord_bytes = 0U;
+        if (ckd_mul(&coord_bytes, cluster_count, sizeof(int32_t))) {
+            goto cleanup;
+        }
+        cache->cluster_center_x = (int32_t *)malloc(coord_bytes);
+        cache->cluster_center_y = (int32_t *)malloc(coord_bytes);
+        cache->cluster_keep_flags = (uint8_t *)calloc(cluster_count, sizeof(uint8_t));
+        if (cache->cluster_center_x == nullptr ||
+            cache->cluster_center_y == nullptr ||
+            cache->cluster_keep_flags == nullptr) {
+            goto cleanup;
+        }
+        for (size_t cluster_index = 0U; cluster_index < cluster_count; cluster_index += 1U) {
+            cache->cluster_center_x[cluster_index] = clusters[cluster_index].canonical_center_x;
+            cache->cluster_center_y[cluster_index] = clusters[cluster_index].canonical_center_y;
+        }
+        cache->cluster_count = cluster_count;
+
+        size_t flat_segment = 0U;
+        for (size_t chain_index = 0U; chain_index < design->chain_count; chain_index += 1U) {
+            const StitchChain chain = design->chains[chain_index];
+            if (chain.point_count < 2U) {
+                continue;
+            }
+            const size_t chain_segments = chain.point_count - 1U;
+            if (chain.color_block_index >= design->block_count ||
+                !design->blocks[chain.color_block_index].enabled) {
+                flat_segment += chain_segments;
+                continue;
+            }
+            const uint8_t color_index = design->blocks[chain.color_block_index].janome_color_index;
+            const StitchPoint *chain_points = &design->points[chain.point_offset];
+
+            for (size_t local_index = 0U; local_index < chain_segments; local_index += 1U) {
+                const StitchPoint start_point = chain_points[local_index];
+                const StitchPoint end_point = chain_points[local_index + 1U];
+                size_t found_cluster = SIZE_MAX;
+
+                if (is_cross_diagonal_for_pitch(start_point, end_point, pitch)) {
+                    const int32_t mid_x =
+                        (int32_t)(((int64_t)start_point.position_x + (int64_t)end_point.position_x) / 2LL);
+                    const int32_t mid_y =
+                        (int32_t)(((int64_t)start_point.position_y + (int64_t)end_point.position_y) / 2LL);
+                    found_cluster = lookup_cross_cluster(
+                        color_index,
+                        mid_x,
+                        mid_y,
+                        bucket_mask,
+                        bucket_heads,
+                        cluster_nodes,
+                        clusters,
+                        diagonal_count
+                    );
+                } else if (is_cross_center_connector(start_point, end_point, pitch)) {
+                    found_cluster = lookup_cross_cluster(
+                        color_index,
+                        start_point.position_x,
+                        start_point.position_y,
+                        bucket_mask,
+                        bucket_heads,
+                        cluster_nodes,
+                        clusters,
+                        diagonal_count
+                    );
+                    if (found_cluster == SIZE_MAX) {
+                        found_cluster = lookup_cross_cluster(
+                            color_index,
+                            end_point.position_x,
+                            end_point.position_y,
+                            bucket_mask,
+                            bucket_heads,
+                            cluster_nodes,
+                            clusters,
+                            diagonal_count
+                        );
+                    }
+                }
+                if (found_cluster != SIZE_MAX && flat_segment + local_index < total_segments) {
+                    cache->segment_cluster_id[flat_segment + local_index] = (int32_t)found_cluster;
+                }
+            }
+            flat_segment += chain_segments;
+        }
+    }
+
+    cache->valid = true;
+    succeeded = true;
+
+cleanup:
+    if (!succeeded) {
+        cross_cluster_cache_free(cache);
+    }
+    scratch_arena_free(&local_scratch);
+    return succeeded;
+}
+
+/* Zero-alloc drag preview using cached cross clusters (exact match to build_edit_segment_mask). */
+bool build_edit_segment_mask_cached(
+    CrossClusterCache *cache,
+    const StitchDesign *design,
+    CrossGridInfo grid,
+    EditOperationKind operation,
+    CutRectangle rectangle,
+    int32_t split_coordinate,
+    bool keep_second_half,
+    uint8_t *keep_mask,
+    size_t mask_length,
+    ScratchArena *scratch
+) {
+    if (mask_length == 0U || keep_mask == nullptr) {
+        return true;
+    }
+    if (cache == nullptr) {
+        return build_edit_segment_mask(
+            design,
+            grid,
+            operation,
+            rectangle,
+            split_coordinate,
+            keep_second_half,
+            keep_mask,
+            mask_length
+        );
+    }
+
+    int32_t pitch = grid.cross_pitch_units;
+    if (pitch < MIN_CROSS_PITCH_UNITS) {
+        pitch = DEFAULT_CROSS_PITCH_UNITS;
+    }
+    if (!cache->valid || cache->built_revision != design->geometry_revision || cache->pitch_units != pitch) {
+        if (!cross_cluster_cache_build(cache, design, pitch, scratch)) {
+            return false;
+        }
+    }
+
+    if (rectangle.minimum_x > rectangle.maximum_x) {
+        const int32_t swap_x = rectangle.minimum_x;
+        rectangle.minimum_x = rectangle.maximum_x;
+        rectangle.maximum_x = swap_x;
+    }
+    if (rectangle.minimum_y > rectangle.maximum_y) {
+        const int32_t swap_y = rectangle.minimum_y;
+        rectangle.minimum_y = rectangle.maximum_y;
+        rectangle.maximum_y = swap_y;
+    }
+
+    const int32_t *cluster_x = cache->cluster_center_x;
+    const int32_t *cluster_y = cache->cluster_center_y;
+    uint8_t *cluster_keep = cache->cluster_keep_flags;
+    const size_t cluster_count = cache->cluster_count;
+
+    for (size_t cluster_index = 0U; cluster_index < cluster_count; cluster_index += 1U) {
+        cluster_keep[cluster_index] = (uint8_t)point_kept_by_edit(
+            operation,
+            cluster_x[cluster_index],
+            cluster_y[cluster_index],
+            rectangle,
+            split_coordinate,
+            keep_second_half
+        );
+    }
+
+    const int32_t *segment_clusters = cache->segment_cluster_id;
+    const size_t cached_total = cache->total_segments;
+    size_t flat_segment_index = 0U;
+    for (size_t chain_index = 0U; chain_index < design->chain_count; chain_index += 1U) {
+        if (flat_segment_index >= mask_length) {
+            break;
+        }
+        const StitchChain chain = design->chains[chain_index];
+        if (chain.point_count < 2U) {
+            continue;
+        }
+        const size_t chain_segments = chain.point_count - 1U;
+        size_t writable_segments = chain_segments;
+        if (flat_segment_index + writable_segments > mask_length) {
+            writable_segments = mask_length - flat_segment_index;
+        }
+        if (chain.color_block_index >= design->block_count ||
+            !design->blocks[chain.color_block_index].enabled) {
+            memset(keep_mask + flat_segment_index, 0, writable_segments);
+            flat_segment_index += chain_segments;
+            continue;
+        }
+
+        const StitchPoint *chain_points = &design->points[chain.point_offset];
+        uint8_t *chain_mask = keep_mask + flat_segment_index;
+        bool any_dropped = false;
+        bool any_kept = false;
+
+        for (size_t local_index = 0U; local_index < writable_segments; local_index += 1U) {
+            const size_t current_flat = flat_segment_index + local_index;
+            uint8_t keep_flag = 0U;
+            if (current_flat < cached_total &&
+                segment_clusters != nullptr &&
+                segment_clusters[current_flat] >= 0) {
+                const size_t cluster_index = (size_t)segment_clusters[current_flat];
+                if (cluster_index < cluster_count) {
+                    keep_flag = cluster_keep[cluster_index];
+                }
+            } else {
+                const StitchPoint start_point = chain_points[local_index];
+                const StitchPoint end_point = chain_points[local_index + 1U];
+                const int32_t mid_x =
+                    (int32_t)(((int64_t)start_point.position_x + (int64_t)end_point.position_x) / 2LL);
+                const int32_t mid_y =
+                    (int32_t)(((int64_t)start_point.position_y + (int64_t)end_point.position_y) / 2LL);
+                keep_flag = (uint8_t)point_kept_by_edit(
+                    operation,
+                    mid_x,
+                    mid_y,
+                    rectangle,
+                    split_coordinate,
+                    keep_second_half
+                );
+            }
+            chain_mask[local_index] = keep_flag;
+            if (keep_flag != 0U) {
+                any_kept = true;
+            } else {
+                any_dropped = true;
+            }
+        }
+
+        /* Only scan for cut artifacts on chains actually split by the edit boundary. */
+        if (any_kept && any_dropped) {
+            size_t local_segment = 0U;
+            while (local_segment < writable_segments) {
+                while (local_segment < writable_segments && chain_mask[local_segment] == 0U) {
+                    local_segment += 1U;
+                }
+                if (local_segment >= writable_segments) {
+                    break;
+                }
+                const size_t run_start = local_segment;
+                while (local_segment < writable_segments && chain_mask[local_segment] != 0U) {
+                    local_segment += 1U;
+                }
+                const size_t run_length = local_segment - run_start;
+                const bool run_was_cut = (run_start > 0U || local_segment < chain_segments);
+                if (run_length > 0U && run_was_cut &&
+                    run_is_cut_artifact(chain_points, run_start, run_length, pitch)) {
+                    memset(chain_mask + run_start, 0, run_length);
+                }
+            }
+        }
+
+        flat_segment_index += chain_segments;
+    }
+
+    if (flat_segment_index < mask_length) {
+        memset(keep_mask + flat_segment_index, 0, mask_length - flat_segment_index);
+    }
+
+    return true;
+}
+
 /* Unified keep-mask builder used identically by both live preview and edit commit. */
 bool build_edit_segment_mask(
     const StitchDesign *design,
@@ -1326,6 +1716,158 @@ CutRectangle resolve_cross_box_at_point(
     return box;
 }
 
+static void check_cross_box_candidate_entry(
+    const StitchDesign *design,
+    SpatialSegmentEntry entry,
+    int32_t pitch,
+    int32_t world_x,
+    int32_t world_y,
+    int64_t *best_distance_squared,
+    int32_t *best_center_x,
+    int32_t *best_center_y,
+    bool *snapped
+) {
+    if ((size_t)entry.chain_index >= design->chain_count) {
+        return;
+    }
+    const StitchChain chain = design->chains[entry.chain_index];
+    if (chain.color_block_index >= design->block_count ||
+        !design->blocks[chain.color_block_index].enabled ||
+        (size_t)entry.local_index + 1U >= chain.point_count) {
+        return;
+    }
+    const StitchPoint start_point = design->points[chain.point_offset + (size_t)entry.local_index];
+    const StitchPoint end_point = design->points[chain.point_offset + (size_t)entry.local_index + 1U];
+    int32_t diagonal_pitch = 0;
+    if (!measure_diagonal_pitch(start_point, end_point, &diagonal_pitch)) {
+        return;
+    }
+    int32_t pitch_error = diagonal_pitch - pitch;
+    if (pitch_error < 0) {
+        pitch_error = -pitch_error;
+    }
+    if (pitch_error > 2) {
+        return;
+    }
+    const int32_t midpoint_x =
+        (int32_t)(((int64_t)start_point.position_x + (int64_t)end_point.position_x) / 2LL);
+    const int32_t midpoint_y =
+        (int32_t)(((int64_t)start_point.position_y + (int64_t)end_point.position_y) / 2LL);
+    const int64_t delta_x = (int64_t)midpoint_x - (int64_t)world_x;
+    const int64_t delta_y = (int64_t)midpoint_y - (int64_t)world_y;
+    const int64_t distance_squared = delta_x * delta_x + delta_y * delta_y;
+    if (distance_squared < *best_distance_squared) {
+        *best_distance_squared = distance_squared;
+        *best_center_x = midpoint_x;
+        *best_center_y = midpoint_y;
+        *snapped = true;
+    }
+}
+
+CutRectangle resolve_cross_box_at_point_indexed(
+    const StitchDesign *design,
+    const DesignSpatialIndex *index,
+    CrossGridInfo grid,
+    int32_t world_x,
+    int32_t world_y,
+    bool *snapped_to_stitch_out
+) {
+    if (index == nullptr || !index->valid || index->cell_offsets == nullptr || index->cell_size <= 0) {
+        return resolve_cross_box_at_point(design, grid, world_x, world_y, snapped_to_stitch_out);
+    }
+
+    int32_t pitch = grid.cross_pitch_units;
+    if (pitch < MIN_CROSS_PITCH_UNITS) {
+        pitch = DEFAULT_CROSS_PITCH_UNITS;
+    }
+
+    const int64_t maximum_search_radius = ((int64_t)pitch * 65LL) / 100LL + 2LL;
+    const int64_t maximum_radius_squared = maximum_search_radius * maximum_search_radius;
+    int64_t best_distance_squared = maximum_radius_squared + 1LL;
+    int32_t best_center_x = 0;
+    int32_t best_center_y = 0;
+    bool snapped = false;
+
+    const int32_t search_span = (int32_t)maximum_search_radius;
+    int32_t min_col = floor_divide_int32(world_x - search_span - index->origin_x, index->cell_size);
+    int32_t max_col = floor_divide_int32(world_x + search_span - index->origin_x, index->cell_size);
+    int32_t min_row = floor_divide_int32(world_y - search_span - index->origin_y, index->cell_size);
+    int32_t max_row = floor_divide_int32(world_y + search_span - index->origin_y, index->cell_size);
+
+    if (min_col < 0) {
+        min_col = 0;
+    }
+    if (max_col >= index->grid_cols) {
+        max_col = index->grid_cols - 1;
+    }
+    if (min_row < 0) {
+        min_row = 0;
+    }
+    if (max_row >= index->grid_rows) {
+        max_row = index->grid_rows - 1;
+    }
+
+    if (index->entries != nullptr && min_col <= max_col && min_row <= max_row) {
+        for (int32_t row = min_row; row <= max_row; row += 1) {
+            for (int32_t col = min_col; col <= max_col; col += 1) {
+                const size_t cell_index = (size_t)row * (size_t)index->grid_cols + (size_t)col;
+                const uint32_t begin = index->cell_offsets[cell_index];
+                const uint32_t end = index->cell_offsets[cell_index + 1U];
+                for (uint32_t slot = begin; slot < end; slot += 1U) {
+                    check_cross_box_candidate_entry(
+                        design,
+                        index->entries[slot],
+                        pitch,
+                        world_x,
+                        world_y,
+                        &best_distance_squared,
+                        &best_center_x,
+                        &best_center_y,
+                        &snapped
+                    );
+                }
+            }
+        }
+    }
+
+    for (size_t overflow_index = 0U; overflow_index < index->overflow_count; overflow_index += 1U) {
+        check_cross_box_candidate_entry(
+            design,
+            index->overflow_entries[overflow_index],
+            pitch,
+            world_x,
+            world_y,
+            &best_distance_squared,
+            &best_center_x,
+            &best_center_y,
+            &snapped
+        );
+    }
+
+    if (snapped_to_stitch_out != nullptr) {
+        *snapped_to_stitch_out = snapped;
+    }
+
+    CutRectangle box = {};
+    if (snapped) {
+        const int32_t half_pitch = pitch / 2;
+        box.minimum_x = best_center_x - half_pitch;
+        box.maximum_x = box.minimum_x + pitch;
+        box.minimum_y = best_center_y - half_pitch;
+        box.maximum_y = box.minimum_y + pitch;
+        return box;
+    }
+
+    int32_t cell_column = 0;
+    int32_t cell_row = 0;
+    world_to_grid_cell(world_x, world_y, grid, &cell_column, &cell_row);
+    box.minimum_x = grid.grid_origin_x + cell_column * pitch;
+    box.maximum_x = box.minimum_x + pitch;
+    box.minimum_y = grid.grid_origin_y + cell_row * pitch;
+    box.maximum_y = box.minimum_y + pitch;
+    return box;
+}
+
 static bool segment_belongs_to_cross_box(
     StitchPoint start_point,
     StitchPoint end_point,
@@ -1427,6 +1969,125 @@ size_t select_cross_box_in_mask(
                 segment_mask[flat_segment_index] = target_value;
             }
             flat_segment_index += 1U;
+        }
+    }
+
+    return matched_count;
+}
+
+static bool entry_matches_cross_box(
+    const StitchDesign *design,
+    SpatialSegmentEntry entry,
+    CutRectangle cross_box
+) {
+    if ((size_t)entry.chain_index >= design->chain_count) {
+        return false;
+    }
+    const StitchChain chain = design->chains[entry.chain_index];
+    if (chain.color_block_index >= design->block_count ||
+        !design->blocks[chain.color_block_index].enabled ||
+        (size_t)entry.local_index + 1U >= chain.point_count) {
+        return false;
+    }
+    return segment_belongs_to_cross_box(
+        design->points[chain.point_offset + (size_t)entry.local_index],
+        design->points[chain.point_offset + (size_t)entry.local_index + 1U],
+        cross_box
+    );
+}
+
+size_t select_cross_box_in_mask_indexed(
+    const StitchDesign *design,
+    const DesignSpatialIndex *index,
+    CutRectangle cross_box,
+    uint8_t *segment_mask,
+    size_t mask_length,
+    bool toggle_mode
+) {
+    if (index == nullptr || !index->valid || index->cell_offsets == nullptr || index->cell_size <= 0) {
+        return select_cross_box_in_mask(design, cross_box, segment_mask, mask_length, toggle_mode);
+    }
+
+    int32_t min_col = floor_divide_int32(cross_box.minimum_x - 2 - index->origin_x, index->cell_size);
+    int32_t max_col = floor_divide_int32(cross_box.maximum_x + 2 - index->origin_x, index->cell_size);
+    int32_t min_row = floor_divide_int32(cross_box.minimum_y - 2 - index->origin_y, index->cell_size);
+    int32_t max_row = floor_divide_int32(cross_box.maximum_y + 2 - index->origin_y, index->cell_size);
+    if (min_col < 0) {
+        min_col = 0;
+    }
+    if (max_col >= index->grid_cols) {
+        max_col = index->grid_cols - 1;
+    }
+    if (min_row < 0) {
+        min_row = 0;
+    }
+    if (max_row >= index->grid_rows) {
+        max_row = index->grid_rows - 1;
+    }
+
+    size_t matched_count = 0U;
+    size_t already_selected_count = 0U;
+
+    if (index->entries != nullptr && min_col <= max_col && min_row <= max_row) {
+        for (int32_t row = min_row; row <= max_row; row += 1) {
+            for (int32_t col = min_col; col <= max_col; col += 1) {
+                const size_t cell_index = (size_t)row * (size_t)index->grid_cols + (size_t)col;
+                const uint32_t begin = index->cell_offsets[cell_index];
+                const uint32_t end = index->cell_offsets[cell_index + 1U];
+                for (uint32_t slot = begin; slot < end; slot += 1U) {
+                    const SpatialSegmentEntry entry = index->entries[slot];
+                    if ((size_t)entry.flat_index < mask_length &&
+                        entry_matches_cross_box(design, entry, cross_box)) {
+                        matched_count += 1U;
+                        if (segment_mask[entry.flat_index] != 0U) {
+                            already_selected_count += 1U;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (size_t overflow_index = 0U; overflow_index < index->overflow_count; overflow_index += 1U) {
+        const SpatialSegmentEntry entry = index->overflow_entries[overflow_index];
+        if ((size_t)entry.flat_index < mask_length &&
+            entry_matches_cross_box(design, entry, cross_box)) {
+            matched_count += 1U;
+            if (segment_mask[entry.flat_index] != 0U) {
+                already_selected_count += 1U;
+            }
+        }
+    }
+
+    if (matched_count == 0U) {
+        return 0U;
+    }
+
+    uint8_t target_value = 1U;
+    if (toggle_mode && already_selected_count == matched_count) {
+        target_value = 0U;
+    }
+
+    if (index->entries != nullptr && min_col <= max_col && min_row <= max_row) {
+        for (int32_t row = min_row; row <= max_row; row += 1) {
+            for (int32_t col = min_col; col <= max_col; col += 1) {
+                const size_t cell_index = (size_t)row * (size_t)index->grid_cols + (size_t)col;
+                const uint32_t begin = index->cell_offsets[cell_index];
+                const uint32_t end = index->cell_offsets[cell_index + 1U];
+                for (uint32_t slot = begin; slot < end; slot += 1U) {
+                    const SpatialSegmentEntry entry = index->entries[slot];
+                    if ((size_t)entry.flat_index < mask_length &&
+                        entry_matches_cross_box(design, entry, cross_box)) {
+                        segment_mask[entry.flat_index] = target_value;
+                    }
+                }
+            }
+        }
+    }
+    for (size_t overflow_index = 0U; overflow_index < index->overflow_count; overflow_index += 1U) {
+        const SpatialSegmentEntry entry = index->overflow_entries[overflow_index];
+        if ((size_t)entry.flat_index < mask_length &&
+            entry_matches_cross_box(design, entry, cross_box)) {
+            segment_mask[entry.flat_index] = target_value;
         }
     }
 
@@ -1580,6 +2241,114 @@ bool find_nearest_chain_at_point(
             }
         }
     }
+    return found;
+}
+
+static void check_nearest_chain_candidate(
+    const StitchDesign *design,
+    SpatialSegmentEntry entry,
+    int32_t world_x,
+    int32_t world_y,
+    int64_t *best_distance_squared,
+    size_t *out_chain_index,
+    bool *found
+) {
+    if ((size_t)entry.chain_index >= design->chain_count) {
+        return;
+    }
+    const StitchChain chain = design->chains[entry.chain_index];
+    if (chain.color_block_index >= design->block_count ||
+        !design->blocks[chain.color_block_index].enabled ||
+        (size_t)entry.local_index + 1U >= chain.point_count) {
+        return;
+    }
+    const int64_t distance_squared = point_to_segment_distance_squared(
+        world_x,
+        world_y,
+        design->points[chain.point_offset + (size_t)entry.local_index],
+        design->points[chain.point_offset + (size_t)entry.local_index + 1U]
+    );
+    if (distance_squared < *best_distance_squared) {
+        *best_distance_squared = distance_squared;
+        *out_chain_index = (size_t)entry.chain_index;
+        *found = true;
+    }
+}
+
+bool find_nearest_chain_at_point_indexed(
+    const StitchDesign *design,
+    const DesignSpatialIndex *index,
+    int32_t world_x,
+    int32_t world_y,
+    int32_t maximum_distance_units,
+    size_t *out_chain_index
+) {
+    if (index == nullptr || !index->valid || index->cell_offsets == nullptr || index->cell_size <= 0) {
+        return find_nearest_chain_at_point(design, world_x, world_y, maximum_distance_units, out_chain_index);
+    }
+
+    const int64_t maximum_distance_squared =
+        (int64_t)maximum_distance_units * (int64_t)maximum_distance_units;
+    int64_t best_distance_squared = maximum_distance_squared + 1LL;
+    bool found = false;
+
+    const int64_t expanded_radius =
+        (int64_t)maximum_distance_units + (int64_t)index->max_cell_segment_half_span;
+    int32_t clamped_radius = INT32_MAX / 4;
+    if (expanded_radius < (int64_t)clamped_radius) {
+        clamped_radius = (int32_t)expanded_radius;
+    }
+
+    int32_t min_col = floor_divide_int32(world_x - clamped_radius - index->origin_x, index->cell_size);
+    int32_t max_col = floor_divide_int32(world_x + clamped_radius - index->origin_x, index->cell_size);
+    int32_t min_row = floor_divide_int32(world_y - clamped_radius - index->origin_y, index->cell_size);
+    int32_t max_row = floor_divide_int32(world_y + clamped_radius - index->origin_y, index->cell_size);
+    if (min_col < 0) {
+        min_col = 0;
+    }
+    if (max_col >= index->grid_cols) {
+        max_col = index->grid_cols - 1;
+    }
+    if (min_row < 0) {
+        min_row = 0;
+    }
+    if (max_row >= index->grid_rows) {
+        max_row = index->grid_rows - 1;
+    }
+
+    if (index->entries != nullptr && min_col <= max_col && min_row <= max_row) {
+        for (int32_t row = min_row; row <= max_row; row += 1) {
+            for (int32_t col = min_col; col <= max_col; col += 1) {
+                const size_t cell_index = (size_t)row * (size_t)index->grid_cols + (size_t)col;
+                const uint32_t begin = index->cell_offsets[cell_index];
+                const uint32_t end = index->cell_offsets[cell_index + 1U];
+                for (uint32_t slot = begin; slot < end; slot += 1U) {
+                    check_nearest_chain_candidate(
+                        design,
+                        index->entries[slot],
+                        world_x,
+                        world_y,
+                        &best_distance_squared,
+                        out_chain_index,
+                        &found
+                    );
+                }
+            }
+        }
+    }
+
+    for (size_t overflow_index = 0U; overflow_index < index->overflow_count; overflow_index += 1U) {
+        check_nearest_chain_candidate(
+            design,
+            index->overflow_entries[overflow_index],
+            world_x,
+            world_y,
+            &best_distance_squared,
+            out_chain_index,
+            &found
+        );
+    }
+
     return found;
 }
 
@@ -1805,6 +2574,74 @@ cleanup:
     free(visited_flags);
     free(same_color_chains);
     free(chain_segment_offsets);
+    return selected_segments;
+}
+
+size_t select_connected_element_in_mask_indexed(
+    const StitchDesign *design,
+    const DesignSpatialIndex *index,
+    size_t seed_chain_index,
+    uint8_t *segment_mask,
+    size_t mask_length,
+    bool toggle_mode
+) {
+    if (index == nullptr || !index->valid ||
+        index->chain_component_id == nullptr ||
+        index->component_chain_offsets == nullptr ||
+        index->component_chains == nullptr ||
+        index->chain_segment_offsets == nullptr ||
+        seed_chain_index >= index->chain_count ||
+        seed_chain_index >= design->chain_count) {
+        CrossGridInfo fallback_grid = {};
+        fallback_grid.cross_pitch_units = DEFAULT_CROSS_PITCH_UNITS;
+        if (index != nullptr && index->component_pitch_units >= MIN_CROSS_PITCH_UNITS) {
+            fallback_grid.cross_pitch_units = index->component_pitch_units;
+        }
+        return select_connected_element_in_mask(
+            design,
+            fallback_grid,
+            seed_chain_index,
+            segment_mask,
+            mask_length,
+            toggle_mode
+        );
+    }
+
+    const size_t component_id = index->chain_component_id[seed_chain_index];
+    if (component_id >= index->component_count) {
+        return 0U;
+    }
+
+    uint8_t target_mask_value = 1U;
+    if (toggle_mode) {
+        const size_t seed_offset = index->chain_segment_offsets[seed_chain_index];
+        if (seed_offset < mask_length && segment_mask[seed_offset] != 0U) {
+            target_mask_value = 0U;
+        }
+    }
+
+    const size_t begin = index->component_chain_offsets[component_id];
+    const size_t end = index->component_chain_offsets[component_id + 1U];
+    size_t selected_segments = 0U;
+
+    for (size_t slot = begin; slot < end && slot < index->chain_count; slot += 1U) {
+        const size_t chain_index = index->component_chains[slot];
+        if (chain_index >= design->chain_count) {
+            continue;
+        }
+        const StitchChain chain = design->chains[chain_index];
+        if (chain.point_count < 2U) {
+            continue;
+        }
+        const size_t segment_offset = index->chain_segment_offsets[chain_index];
+        const size_t segment_count = chain.point_count - 1U;
+        for (size_t local_segment = 0U; local_segment < segment_count; local_segment += 1U) {
+            if (segment_offset + local_segment < mask_length) {
+                segment_mask[segment_offset + local_segment] = target_mask_value;
+                selected_segments += 1U;
+            }
+        }
+    }
     return selected_segments;
 }
 
@@ -2454,10 +3291,43 @@ bool draw_single_cross_into_design(
         )) {
         goto cleanup;
     }
-    if (!sort_chains_by_color_block(design)) {
-        goto cleanup;
+
+    /* Insert newly appended chain contiguously into its color block without allocating. */
+    if (design->chain_count >= 2U) {
+        const StitchChain new_chain = design->chains[design->chain_count - 1U];
+        size_t insert_index = design->chain_count - 1U;
+        while (insert_index > 0U &&
+               design->chains[insert_index - 1U].color_block_index > color_block_index) {
+            insert_index -= 1U;
+        }
+        if (insert_index < design->chain_count - 1U) {
+            const size_t move_count = (design->chain_count - 1U) - insert_index;
+            memmove(
+                &design->chains[insert_index + 1U],
+                &design->chains[insert_index],
+                move_count * sizeof(StitchChain)
+            );
+            design->chains[insert_index] = new_chain;
+        }
     }
-    recompute_design_bounds(design);
+
+    int64_t min_x = (int64_t)design->minimum_x;
+    int64_t max_x = (int64_t)design->maximum_x;
+    int64_t min_y = (int64_t)design->minimum_y;
+    int64_t max_y = (int64_t)design->maximum_y;
+    bool has_bounds = design->has_bounds;
+    const StitchChain last_added = design->chains[design->chain_count - 1U];
+    if (last_added.color_block_index == color_block_index) {
+        expand_bounds_from_chain(design, last_added, &has_bounds, &min_x, &max_x, &min_y, &max_y);
+        design->has_bounds = has_bounds;
+        design->minimum_x = (int32_t)min_x;
+        design->maximum_x = (int32_t)max_x;
+        design->minimum_y = (int32_t)min_y;
+        design->maximum_y = (int32_t)max_y;
+    } else {
+        recompute_design_bounds(design);
+    }
+    design_mark_mutated(design);
     succeeded = true;
 
 cleanup:
@@ -2733,30 +3603,45 @@ cleanup:
 }
 
 void rotate_design_90_clockwise(StitchDesign *design) {
+    if (!design_ensure_unique_points(design)) {
+        return;
+    }
     for (size_t point_index = 0U; point_index < design->point_count; point_index += 1U) {
         const int32_t old_x = design->points[point_index].position_x;
         const int32_t old_y = design->points[point_index].position_y;
         design->points[point_index].position_x = -old_y;
         design->points[point_index].position_y = old_x;
     }
+    design_mark_mutated(design);
     recompute_design_bounds(design);
 }
 
 void mirror_design_horizontal(StitchDesign *design) {
+    if (!design_ensure_unique_points(design)) {
+        return;
+    }
     for (size_t point_index = 0U; point_index < design->point_count; point_index += 1U) {
         design->points[point_index].position_x = -design->points[point_index].position_x;
     }
+    design_mark_mutated(design);
     recompute_design_bounds(design);
 }
 
 void mirror_design_vertical(StitchDesign *design) {
+    if (!design_ensure_unique_points(design)) {
+        return;
+    }
     for (size_t point_index = 0U; point_index < design->point_count; point_index += 1U) {
         design->points[point_index].position_y = -design->points[point_index].position_y;
     }
+    design_mark_mutated(design);
     recompute_design_bounds(design);
 }
 
 void shift_design_center(StitchDesign *design, int32_t delta_x, int32_t delta_y) {
+    if (!design_ensure_unique_points(design)) {
+        return;
+    }
     for (size_t point_index = 0U; point_index < design->point_count; point_index += 1U) {
         const int64_t next_x = (int64_t)design->points[point_index].position_x + (int64_t)delta_x;
         const int64_t next_y = (int64_t)design->points[point_index].position_y + (int64_t)delta_y;
@@ -2770,6 +3655,7 @@ void shift_design_center(StitchDesign *design, int32_t delta_x, int32_t delta_y)
         design->points[point_index].position_y += delta_y;
     }
     design->has_manual_center_shift = true;
+    design_mark_mutated(design);
     recompute_design_bounds(design);
 }
 
@@ -2783,6 +3669,50 @@ void history_clear(EditHistory *history) {
     }
     history->state_count = 0U;
     history->current_index = 0U;
+}
+
+/* Sum metadata + unique SharedPointBuffer memory across all stored history snapshots. */
+size_t history_estimated_bytes(const EditHistory *history) {
+    size_t total_bytes = 0U;
+    for (size_t state_index = 0U; state_index < history->state_count; state_index += 1U) {
+        const StitchDesign *entry = &history->states[state_index];
+        const size_t metadata = design_metadata_bytes(entry);
+        if (ckd_add(&total_bytes, total_bytes, metadata)) {
+            return SIZE_MAX;
+        }
+        if (entry->point_buffer == nullptr) {
+            continue;
+        }
+        bool already_counted = false;
+        for (size_t prior = 0U; prior < state_index; prior += 1U) {
+            if (history->states[prior].point_buffer == entry->point_buffer) {
+                already_counted = true;
+                break;
+            }
+        }
+        if (!already_counted) {
+            const size_t point_bytes = design_point_buffer_bytes(entry);
+            if (ckd_add(&total_bytes, total_bytes, point_bytes)) {
+                return SIZE_MAX;
+            }
+        }
+    }
+    return total_bytes;
+}
+
+static void history_evict_oldest(EditHistory *history) {
+    if (history->state_count <= 1U) {
+        return;
+    }
+    free_stitch_design(&history->states[0]);
+    for (size_t shift_index = 1U; shift_index < history->state_count; shift_index += 1U) {
+        history->states[shift_index - 1U] = history->states[shift_index];
+    }
+    init_stitch_design(&history->states[history->state_count - 1U]);
+    history->state_count -= 1U;
+    if (history->current_index > 0U) {
+        history->current_index -= 1U;
+    }
 }
 
 bool history_push(EditHistory *history, const StitchDesign *design) {
@@ -2801,20 +3731,16 @@ bool history_push(EditHistory *history, const StitchDesign *design) {
     }
 
     if (history->state_count == MAX_HISTORY_STATES) {
-        free_stitch_design(&history->states[0]);
-        for (size_t shift_index = 1U; shift_index < MAX_HISTORY_STATES; shift_index += 1U) {
-            history->states[shift_index - 1U] = history->states[shift_index];
-        }
-        init_stitch_design(&history->states[MAX_HISTORY_STATES - 1U]);
-        history->state_count = MAX_HISTORY_STATES - 1U;
-        if (history->current_index > 0U) {
-            history->current_index -= 1U;
-        }
+        history_evict_oldest(history);
     }
 
     history->states[history->state_count] = snapshot;
     history->current_index = history->state_count;
     history->state_count += 1U;
+
+    while (history->state_count > 1U && history_estimated_bytes(history) > MAX_HISTORY_BYTES) {
+        history_evict_oldest(history);
+    }
     return true;
 }
 

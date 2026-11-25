@@ -26,6 +26,8 @@ constexpr int32_t STRIP_MAX_GRID_DIM = 64;
 constexpr int32_t STRIP_MAX_REPEAT = 64;
 constexpr size_t STRIP_MAX_EXPANDED_CELLS = 262144U;
 constexpr size_t MAX_PATH_BUFFER = 4096U;
+constexpr int32_t SPATIAL_GRID_MAX_DIM = 256;
+constexpr size_t SCRATCH_ARENA_ALIGN = 16U;
 
 /* Bound coordinates to +/-10 km in 0.1 mm stitch units to prevent overflow. */
 constexpr int64_t MAX_COORDINATE_MAGNITUDE = 100000000LL;
@@ -35,6 +37,7 @@ static_assert(BROTHER_PALETTE_COUNT == 65U, "Brother palette must contain 65 ent
 static_assert(DST_DEFAULT_PALETTE_COUNT == 8U, "DST default palette must contain 8 entries");
 static_assert(MIN_CROSS_PITCH_UNITS > 0 && MAX_CROSS_PITCH_UNITS >= MIN_CROSS_PITCH_UNITS);
 static_assert(MIN_CROSS_PASSES >= 1 && MAX_CROSS_PASSES >= MIN_CROSS_PASSES);
+static_assert((SCRATCH_ARENA_ALIGN & (SCRATCH_ARENA_ALIGN - 1U)) == 0U);
 
 typedef enum : uint8_t {
     FORMAT_UNKNOWN = 0U,
@@ -63,6 +66,12 @@ typedef struct {
 } StitchPoint;
 
 typedef struct {
+    size_t ref_count;
+    size_t capacity;
+    StitchPoint *points;
+} SharedPointBuffer;
+
+typedef struct {
     size_t point_offset;
     size_t point_count;
     size_t color_block_index;
@@ -77,12 +86,21 @@ typedef struct {
 } ColorBlock;
 
 typedef struct {
+    size_t stitch_count;
+    size_t chain_count;
+    size_t color_count;
+    size_t jump_count;
+    size_t lock_count;
+} DesignStats;
+
+typedef struct {
     ColorBlock *blocks;
     size_t block_count;
     size_t block_capacity;
     StitchChain *chains;
     size_t chain_count;
     size_t chain_capacity;
+    SharedPointBuffer *point_buffer;
     StitchPoint *points;
     size_t point_count;
     size_t point_capacity;
@@ -92,6 +110,9 @@ typedef struct {
     int32_t maximum_y;
     bool has_bounds;
     bool has_manual_center_shift;
+    DesignStats cached_stats;
+    bool stats_valid;
+    uint64_t geometry_revision;
 } StitchDesign;
 
 typedef struct {
@@ -122,12 +143,41 @@ typedef struct {
 } CutRectangle;
 
 typedef struct {
-    size_t stitch_count;
+    uint8_t *buffer;
+    size_t capacity;
+    size_t used;
+} ScratchArena;
+
+typedef struct {
+    uint32_t chain_index;
+    uint32_t local_index;
+    uint32_t flat_index;
+} SpatialSegmentEntry;
+
+typedef struct {
+    int32_t origin_x;
+    int32_t origin_y;
+    int32_t cell_size;
+    int32_t grid_cols;
+    int32_t grid_rows;
+    int32_t max_cell_segment_half_span;
+    size_t cell_count;
+    size_t entry_count;
+    size_t overflow_count;
+    size_t total_segments;
     size_t chain_count;
-    size_t color_count;
-    size_t jump_count;
-    size_t lock_count;
-} DesignStats;
+    uint32_t *cell_offsets;
+    SpatialSegmentEntry *entries;
+    SpatialSegmentEntry *overflow_entries;
+    size_t *chain_segment_offsets;
+    int32_t component_pitch_units;
+    size_t component_count;
+    size_t *chain_component_id;
+    size_t *component_chain_offsets;
+    size_t *component_chains;
+    uint64_t built_revision;
+    bool valid;
+} DesignSpatialIndex;
 
 extern const RgbColor janome_palette[JANOME_PALETTE_COUNT];
 extern const RgbColor brother_palette[BROTHER_PALETTE_COUNT];
@@ -142,8 +192,16 @@ int32_t floor_divide_int32(int32_t dividend, int32_t divisor);
 int32_t positive_modulo_int32(int32_t value, int32_t modulus);
 uint8_t find_nearest_janome_color(RgbColor target_color);
 
+void scratch_arena_init(ScratchArena *arena);
+void scratch_arena_free(ScratchArena *arena);
+void scratch_arena_reset(ScratchArena *arena);
+bool scratch_arena_prepare(ScratchArena *arena, size_t required_bytes);
+void *scratch_arena_push(ScratchArena *arena, size_t element_count, size_t element_size);
+bool scratch_arena_add_slice_bytes(size_t *total_bytes, size_t element_count, size_t element_size);
+
 void init_stitch_design(StitchDesign *design);
 void free_stitch_design(StitchDesign *design);
+bool design_ensure_unique_points(StitchDesign *design);
 bool design_reserve_points(StitchDesign *design, size_t required_count);
 bool design_reserve_chains(StitchDesign *design, size_t required_count);
 bool design_reserve_blocks(StitchDesign *design, size_t required_count);
@@ -163,6 +221,9 @@ bool design_append_block(
     bool enabled,
     size_t *output_block_index
 );
+void design_mark_mutated(StitchDesign *design);
+size_t design_metadata_bytes(const StitchDesign *design);
+size_t design_point_buffer_bytes(const StitchDesign *design);
 
 void expand_bounds_from_chain(
     const StitchDesign *design,
@@ -186,6 +247,16 @@ bool point_is_strictly_inside_rectangle(
     int32_t point_x,
     int32_t point_y,
     CutRectangle rectangle
+);
+
+void spatial_index_init(DesignSpatialIndex *index);
+void spatial_index_free(DesignSpatialIndex *index);
+void spatial_index_invalidate(DesignSpatialIndex *index);
+bool spatial_index_build(
+    DesignSpatialIndex *index,
+    const StitchDesign *design,
+    int32_t cross_pitch_units,
+    ScratchArena *scratch
 );
 
 #endif

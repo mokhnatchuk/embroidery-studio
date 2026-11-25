@@ -4,12 +4,25 @@
 #include "model.h"
 
 constexpr size_t MAX_HISTORY_STATES = 32U;
+constexpr size_t MAX_HISTORY_BYTES = 128U * 1024U * 1024U;
 
 typedef struct {
     StitchDesign states[MAX_HISTORY_STATES];
     size_t state_count;
     size_t current_index;
 } EditHistory;
+
+typedef struct {
+    int32_t pitch_units;
+    size_t cluster_count;
+    size_t total_segments;
+    int32_t *cluster_center_x;
+    int32_t *cluster_center_y;
+    uint8_t *cluster_keep_flags;
+    int32_t *segment_cluster_id;
+    uint64_t built_revision;
+    bool valid;
+} CrossClusterCache;
 
 CrossGridInfo detect_cross_stitch_grid(const StitchDesign *design);
 
@@ -24,6 +37,16 @@ bool is_cross_center_connector(
     int32_t pitch_units
 );
 
+void cross_cluster_cache_init(CrossClusterCache *cache);
+void cross_cluster_cache_free(CrossClusterCache *cache);
+void cross_cluster_cache_invalidate(CrossClusterCache *cache);
+bool cross_cluster_cache_build(
+    CrossClusterCache *cache,
+    const StitchDesign *design,
+    int32_t pitch_units,
+    ScratchArena *scratch
+);
+
 bool build_edit_segment_mask(
     const StitchDesign *design,
     CrossGridInfo grid,
@@ -33,6 +56,18 @@ bool build_edit_segment_mask(
     bool keep_second_half,
     uint8_t *keep_mask,
     size_t mask_length
+);
+bool build_edit_segment_mask_cached(
+    CrossClusterCache *cache,
+    const StitchDesign *design,
+    CrossGridInfo grid,
+    EditOperationKind operation,
+    CutRectangle rectangle,
+    int32_t split_coordinate,
+    bool keep_second_half,
+    uint8_t *keep_mask,
+    size_t mask_length,
+    ScratchArena *scratch
 );
 bool append_locked_subchain(
     StitchDesign *destination,
@@ -68,8 +103,24 @@ CutRectangle resolve_cross_box_at_point(
     int32_t world_y,
     bool *snapped_to_stitch_out
 );
+CutRectangle resolve_cross_box_at_point_indexed(
+    const StitchDesign *design,
+    const DesignSpatialIndex *index,
+    CrossGridInfo grid,
+    int32_t world_x,
+    int32_t world_y,
+    bool *snapped_to_stitch_out
+);
 size_t select_cross_box_in_mask(
     const StitchDesign *design,
+    CutRectangle cross_box,
+    uint8_t *segment_mask,
+    size_t mask_length,
+    bool toggle_mode
+);
+size_t select_cross_box_in_mask_indexed(
+    const StitchDesign *design,
+    const DesignSpatialIndex *index,
     CutRectangle cross_box,
     uint8_t *segment_mask,
     size_t mask_length,
@@ -99,9 +150,25 @@ bool find_nearest_chain_at_point(
     int32_t maximum_distance_units,
     size_t *out_chain_index
 );
+bool find_nearest_chain_at_point_indexed(
+    const StitchDesign *design,
+    const DesignSpatialIndex *index,
+    int32_t world_x,
+    int32_t world_y,
+    int32_t maximum_distance_units,
+    size_t *out_chain_index
+);
 size_t select_connected_element_in_mask(
     const StitchDesign *design,
     CrossGridInfo grid,
+    size_t seed_chain_index,
+    uint8_t *segment_mask,
+    size_t mask_length,
+    bool toggle_mode
+);
+size_t select_connected_element_in_mask_indexed(
+    const StitchDesign *design,
+    const DesignSpatialIndex *index,
     size_t seed_chain_index,
     uint8_t *segment_mask,
     size_t mask_length,
@@ -160,6 +227,7 @@ void shift_design_center(StitchDesign *design, int32_t delta_x, int32_t delta_y)
 
 void history_init(EditHistory *history);
 void history_clear(EditHistory *history);
+size_t history_estimated_bytes(const EditHistory *history);
 bool history_push(EditHistory *history, const StitchDesign *design);
 bool history_can_undo(const EditHistory *history);
 bool history_can_redo(const EditHistory *history);
