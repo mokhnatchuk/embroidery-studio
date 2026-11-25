@@ -763,7 +763,7 @@ static bool test_core_editing_workflows(void) {
     }
     if (!assert_condition(
             recolor_masked_segments(&original, segment_mask, total_segments, 12U, &edited),
-            "Sel Elem recolor to Janome index 12"
+            "Sel Elem recolor to JEF palette index 12"
         )) {
         goto cleanup;
     }
@@ -1530,10 +1530,12 @@ static bool test_headless_render_modes(void) {
     ui_state.grid = grid;
     fit_camera_to_design(&ui_state, ui_canvas.width, ui_canvas.height);
     render_editor_frame(&ui_canvas, &ui_state);
+    const EditorLayout ui_layout = compute_editor_layout(&ui_state, ui_canvas.width, ui_canvas.height);
     if (!assert_condition(
-            ui_state.toolbar_button_count >= 30U &&
-            hit_test_toolbar(&ui_state, ui_state.toolbar_buttons[0].left_x + 4, ui_state.toolbar_buttons[0].top_y + 4) == COMMAND_OPEN_FILE_DIALOG,
-            "headless render_editor_frame and hit_test_toolbar succeed without SDL"
+            ui_layout.top_button_count >= 10U &&
+            ui_layout.rail_button_count == 15U &&
+            hit_test_editor_buttons(&ui_layout, ui_layout.top_buttons[0].left_x + 4, ui_layout.top_buttons[0].top_y + 4) == COMMAND_OPEN_FILE_DIALOG,
+            "headless render_editor_frame and unified hit_test_editor_buttons succeed without SDL"
         )) {
         goto cleanup;
     }
@@ -1558,6 +1560,592 @@ cleanup:
     return passed;
 }
 
+static bool test_stage2_caches_and_cow_history(void) {
+    bool passed = false;
+    StitchDesign design = {};
+    StitchDesign snapshot_copy = {};
+    EditHistory history = {};
+    ScratchArena scratch = {};
+    DesignSpatialIndex spatial = {};
+    CrossClusterCache cross_cache = {};
+    uint8_t *mask_plain = nullptr;
+    uint8_t *mask_cached = nullptr;
+    uint8_t *sel_plain = nullptr;
+    uint8_t *sel_indexed = nullptr;
+    EditorState editor = {};
+    PixelCanvas canvas = {};
+
+    history_init(&history);
+    scratch_arena_init(&scratch);
+    spatial_index_init(&spatial);
+    cross_cluster_cache_init(&cross_cache);
+    init_default_editor_state(&editor);
+
+    if (!build_synthetic_cross_grid_design(&design)) {
+        goto cleanup;
+    }
+    const CrossGridInfo grid = detect_cross_stitch_grid(&design);
+    const size_t total_segments = count_design_segments(&design);
+    if (!assert_condition(total_segments > 500U, "sample grid has enough segments for Stage 2 checks")) {
+        goto cleanup;
+    }
+
+    /* 1. SharedPointBuffer CoW + EditHistory deduplicated memory accounting. */
+    const SharedPointBuffer *initial_buffer = design.point_buffer;
+    if (!assert_condition(initial_buffer != nullptr && initial_buffer->ref_count == 1U, "fresh design owns unique SharedPointBuffer")) {
+        goto cleanup;
+    }
+    for (size_t step = 0U; step < 10U; step += 1U) {
+        if (!assert_condition(history_push(&history, &design), "history_push with shared points")) {
+            goto cleanup;
+        }
+    }
+    if (!assert_condition(
+            design.point_buffer == initial_buffer && initial_buffer->ref_count == 11U,
+            "10 history snapshots share one SharedPointBuffer with ref_count=11"
+        )) {
+        goto cleanup;
+    }
+    const size_t single_point_bytes = design_point_buffer_bytes(&design);
+    const size_t expected_history_bytes =
+        single_point_bytes + 10U * design_metadata_bytes(&history.states[0]);
+    const size_t estimated_bytes = history_estimated_bytes(&history);
+    if (!assert_condition(
+            estimated_bytes == expected_history_bytes,
+            "history_estimated_bytes counts shared SharedPointBuffer only once"
+        )) {
+        goto cleanup;
+    }
+
+    /* Geometry mutation must detach CoW buffer without altering history snapshots. */
+    const StitchPoint saved_first_point = history.states[0].points[0];
+    rotate_design_90_clockwise(&design);
+    if (!assert_condition(
+            design.point_buffer != initial_buffer &&
+            initial_buffer->ref_count == 10U &&
+            history.states[0].points[0].position_x == saved_first_point.position_x &&
+            history.states[0].points[0].position_y == saved_first_point.position_y,
+            "rotate_design_90_clockwise detaches CoW buffer and preserves history snapshots"
+        )) {
+        goto cleanup;
+    }
+    if (!assert_condition(history_undo(&history, &design), "undo restores original unrotated design")) {
+        goto cleanup;
+    }
+
+    /* 2. SpatialIndex exact equivalence with unindexed ops. */
+    if (!assert_condition(
+            spatial_index_build(&spatial, &design, grid.cross_pitch_units, &scratch),
+            "spatial_index_build succeeds"
+        )) {
+        goto cleanup;
+    }
+    const int32_t probe_x = design.minimum_x + 5 * 18 + 9;
+    const int32_t probe_y = design.minimum_y + 4 * 18 + 9;
+    bool snapped_plain = false;
+    bool snapped_indexed = false;
+    const CutRectangle box_plain = resolve_cross_box_at_point(&design, grid, probe_x, probe_y, &snapped_plain);
+    const CutRectangle box_indexed =
+        resolve_cross_box_at_point_indexed(&design, &spatial, grid, probe_x, probe_y, &snapped_indexed);
+    if (!assert_condition(
+            snapped_plain == snapped_indexed &&
+            box_plain.minimum_x == box_indexed.minimum_x &&
+            box_plain.maximum_x == box_indexed.maximum_x &&
+            box_plain.minimum_y == box_indexed.minimum_y &&
+            box_plain.maximum_y == box_indexed.maximum_y,
+            "resolve_cross_box_at_point_indexed matches unindexed exactly"
+        )) {
+        goto cleanup;
+    }
+
+    size_t chain_plain = SIZE_MAX;
+    size_t chain_indexed = SIZE_MAX;
+    const bool found_plain = find_nearest_chain_at_point(&design, probe_x, probe_y, 24, &chain_plain);
+    const bool found_indexed = find_nearest_chain_at_point_indexed(&design, &spatial, probe_x, probe_y, 24, &chain_indexed);
+    if (!assert_condition(found_plain && found_indexed && chain_plain == chain_indexed, "find_nearest_chain_at_point_indexed matches unindexed")) {
+        goto cleanup;
+    }
+
+    sel_plain = (uint8_t *)calloc(total_segments, sizeof(uint8_t));
+    sel_indexed = (uint8_t *)calloc(total_segments, sizeof(uint8_t));
+    if (sel_plain == nullptr || sel_indexed == nullptr) {
+        goto cleanup;
+    }
+    const size_t elem_plain = select_connected_element_in_mask(&design, grid, chain_plain, sel_plain, total_segments, false);
+    const size_t elem_indexed = select_connected_element_in_mask_indexed(&design, &spatial, chain_indexed, sel_indexed, total_segments, false);
+    if (!assert_condition(
+            elem_plain > 0U && elem_plain == elem_indexed && memcmp(sel_plain, sel_indexed, total_segments) == 0,
+            "select_connected_element_in_mask_indexed matches unindexed BFS bit-for-bit"
+        )) {
+        goto cleanup;
+    }
+
+    memset(sel_plain, 0, total_segments);
+    memset(sel_indexed, 0, total_segments);
+    const size_t cross_plain = select_cross_box_in_mask(&design, box_plain, sel_plain, total_segments, false);
+    const size_t cross_indexed = select_cross_box_in_mask_indexed(&design, &spatial, box_indexed, sel_indexed, total_segments, false);
+    if (!assert_condition(
+            cross_plain > 0U && cross_plain == cross_indexed && memcmp(sel_plain, sel_indexed, total_segments) == 0,
+            "select_cross_box_in_mask_indexed matches unindexed bit-for-bit"
+        )) {
+        goto cleanup;
+    }
+
+    /* 3. CrossClusterCache exact bit-for-bit match across Cut/Crop/Split. */
+    mask_plain = (uint8_t *)calloc(total_segments, sizeof(uint8_t));
+    mask_cached = (uint8_t *)calloc(total_segments, sizeof(uint8_t));
+    if (mask_plain == nullptr || mask_cached == nullptr) {
+        goto cleanup;
+    }
+    const CutRectangle edit_box = {
+        design.minimum_x + 3 * 18,
+        design.minimum_y + 2 * 18,
+        design.minimum_x + 7 * 18,
+        design.minimum_y + 8 * 18
+    };
+    const EditOperationKind ops[4] = {
+        EDIT_CUT_OUT, EDIT_CROP_KEEP, EDIT_SPLIT_VERTICAL, EDIT_SPLIT_HORIZONTAL
+    };
+    for (size_t op_index = 0U; op_index < 4U; op_index += 1U) {
+        if (!assert_condition(
+                build_edit_segment_mask(&design, grid, ops[op_index], edit_box, probe_x, false, mask_plain, total_segments) &&
+                build_edit_segment_mask_cached(&cross_cache, &design, grid, ops[op_index], edit_box, probe_x, false, mask_cached, total_segments, &scratch) &&
+                memcmp(mask_plain, mask_cached, total_segments) == 0,
+                "build_edit_segment_mask_cached matches uncached bit-for-bit"
+            )) {
+            goto cleanup;
+        }
+    }
+
+    /* 4. Two-layer StitchLayerCache + headless hover update. */
+    if (!assert_condition(init_pixel_canvas(&canvas, 1280, 720), "init canvas for Stage 2 render cache test")) {
+        goto cleanup;
+    }
+    if (!assert_condition(clone_stitch_design(&design, &editor.design), "clone design into editor")) {
+        goto cleanup;
+    }
+    editor.grid = grid;
+    editor_mark_design_changed(&editor, false);
+    fit_camera_to_design(&editor, canvas.width, canvas.height);
+    render_editor_frame(&canvas, &editor);
+    if (!assert_condition(editor.stitch_cache.valid, "first frame populates StitchLayerCache")) {
+        goto cleanup;
+    }
+    const int32_t hover_screen_x = editor_world_to_screen_x(&editor, canvas.width, canvas.height, probe_x);
+    const int32_t hover_screen_y = editor_world_to_screen_y(&editor, canvas.width, canvas.height, probe_y);
+    editor_update_canvas_hover(&editor, hover_screen_x, hover_screen_y, canvas.width, canvas.height);
+    if (!assert_condition(
+            editor.hover_component_id < editor.spatial_index.component_count,
+            "Sel Elem hover resolves precomputed component ID without hover_mask allocation"
+        )) {
+        goto cleanup;
+    }
+    editor.mouse_screen_x = hover_screen_x;
+    editor.mouse_screen_y = hover_screen_y;
+    render_editor_frame(&canvas, &editor);
+
+    /* Move hover elsewhere and verify dirty-rect incremental frame matches a fresh full canvas pixel-for-pixel. */
+    editor.active_tool = TOOL_SELECT_CROSS;
+    clear_hover_preview(&editor);
+    editor_update_canvas_hover(&editor, hover_screen_x + 24, hover_screen_y + 12, canvas.width, canvas.height);
+    editor.mouse_screen_x = hover_screen_x + 24;
+    editor.mouse_screen_y = hover_screen_y + 12;
+    render_editor_frame(&canvas, &editor);
+
+    PixelCanvas reference_canvas = {};
+    if (!assert_condition(init_pixel_canvas(&reference_canvas, canvas.width, canvas.height), "init reference canvas")) {
+        goto cleanup;
+    }
+    render_editor_frame(&reference_canvas, &editor);
+    const size_t frame_bytes = (size_t)canvas.width * (size_t)canvas.height * sizeof(uint32_t);
+    const bool pixel_exact = (memcmp(canvas.pixels, reference_canvas.pixels, frame_bytes) == 0);
+    free_pixel_canvas(&reference_canvas);
+    if (!assert_condition(pixel_exact, "dirty-rect incremental hover frame matches fresh full render pixel-for-pixel")) {
+        goto cleanup;
+    }
+
+    printf("[PASS] Stage 2 caches, CoW SharedPointBuffer, SpatialIndex, and StitchLayerCache\n");
+    passed = true;
+
+cleanup:
+    free_pixel_canvas(&canvas);
+    free_editor_state(&editor);
+    free(sel_indexed);
+    free(sel_plain);
+    free(mask_cached);
+    free(mask_plain);
+    cross_cluster_cache_free(&cross_cache);
+    spatial_index_free(&spatial);
+    scratch_arena_free(&scratch);
+    history_clear(&history);
+    free_stitch_design(&snapshot_copy);
+    free_stitch_design(&design);
+    return passed;
+}
+
+static bool buttons_overlap(const UiButton *first, const UiButton *second) {
+    return first->left_x < second->left_x + second->width &&
+           first->left_x + first->width > second->left_x &&
+           first->top_y < second->top_y + second->height &&
+           first->top_y + first->height > second->top_y;
+}
+
+static bool verify_button_group_bounds_and_disjoint(
+    const UiFont *font,
+    const UiButton *buttons,
+    size_t count,
+    UiRect container,
+    const char *label
+) {
+    for (size_t first_index = 0U; first_index < count; first_index += 1U) {
+        const UiButton *btn = &buttons[first_index];
+        if (btn->width <= 0 || btn->height <= 0 ||
+            btn->left_x < container.x ||
+            btn->top_y < container.y ||
+            btn->left_x + btn->width > container.x + container.width ||
+            btn->top_y + btn->height > container.y + container.height) {
+            fprintf(stderr, "Layout bounds violation in %s (button %zu '%s')\n", label, first_index, btn->label);
+            return false;
+        }
+        const int32_t label_width = measure_ui_text_width(font, btn->label);
+        if (label_width > btn->width - 4) {
+            fprintf(
+                stderr,
+                "Label overflow in %s (button %zu '%s': text=%d px > width=%d px)\n",
+                label,
+                first_index,
+                btn->label,
+                label_width,
+                btn->width
+            );
+            return false;
+        }
+        for (size_t second_index = first_index + 1U; second_index < count; second_index += 1U) {
+            if (buttons_overlap(btn, &buttons[second_index])) {
+                fprintf(
+                    stderr,
+                    "Layout overlap in %s ('%s' vs '%s')\n",
+                    label,
+                    btn->label,
+                    buttons[second_index].label
+                );
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static size_t count_antialiased_pixels(
+    const PixelCanvas *canvas,
+    uint32_t background_pixel,
+    uint32_t foreground_pixel
+) {
+    size_t aa_count = 0U;
+    const size_t total_pixels = (size_t)canvas->width * (size_t)canvas->height;
+    for (size_t pixel_index = 0U; pixel_index < total_pixels; pixel_index += 1U) {
+        const uint32_t pixel = canvas->pixels[pixel_index];
+        if (pixel != background_pixel && pixel != foreground_pixel) {
+            aa_count += 1U;
+        }
+    }
+    return aa_count;
+}
+
+static bool test_stage3_headless_layouts_and_cyrillic(void) {
+    bool passed = false;
+    EditorState state = {};
+    PixelCanvas canvas = {};
+    UiFont fallback_font = {};
+    init_default_editor_state(&state);
+
+    if (!build_synthetic_cross_grid_design(&state.design)) {
+        goto cleanup;
+    }
+    state.grid = detect_cross_stitch_grid(&state.design);
+    editor_mark_design_changed(&state, true);
+    (void)snprintf(state.current_file_path, sizeof(state.current_file_path), "/tmp/Вишиванка_Ґанок_Їжачок.jef");
+    state.has_file_path = true;
+    set_status_message(&state, "Готово: Вишивка Єднає Її Ґанок!");
+
+    const int32_t widths[3] = {1920, 1280, 960};
+    const int32_t heights[3] = {1080, 720, 1080};
+
+    for (size_t res_index = 0U; res_index < 3U; res_index += 1U) {
+        const int32_t width = widths[res_index];
+        const int32_t height = heights[res_index];
+        free_pixel_canvas(&canvas);
+        if (!assert_condition(init_pixel_canvas(&canvas, width, height), "init layout test canvas")) {
+            goto cleanup;
+        }
+
+        for (size_t collapse_step = 0U; collapse_step < 2U; collapse_step += 1U) {
+            state.right_panel_collapsed = (collapse_step == 1U);
+            const EditorLayout layout = compute_editor_layout(&state, width, height);
+
+            if (!assert_condition(
+                    layout.top_bar.height == TOP_BAR_HEIGHT &&
+                    layout.left_rail.width == LEFT_RAIL_WIDTH &&
+                    layout.bottom_bar.height == BOTTOM_BAR_HEIGHT,
+                    "panel heights and widths match compact spec"
+                )) {
+                goto cleanup;
+            }
+            if (!assert_condition(
+                    layout.viewport.width >= 600 && layout.viewport.height >= 600,
+                    "viewport retains generous area across 1920x1080, 1280x720, 960x1080"
+                )) {
+                goto cleanup;
+            }
+            if (state.right_panel_collapsed) {
+                if (!assert_condition(
+                        layout.right_panel.width == 0 && layout.viewport.width == width - LEFT_RAIL_WIDTH,
+                        "collapsed right panel gives full remaining width to viewport"
+                    )) {
+                    goto cleanup;
+                }
+            } else {
+                if (!assert_condition(
+                        layout.right_panel.width == RIGHT_PANEL_WIDTH &&
+                        layout.prop_button_count >= 12U &&
+                        verify_button_group_bounds_and_disjoint(&state.ui_font, layout.prop_buttons, layout.prop_button_count, layout.right_panel, "right_panel"),
+                        "right panel prop buttons fit inside panel with zero overlap or text overflow"
+                    )) {
+                    goto cleanup;
+                }
+            }
+            if (!assert_condition(
+                    layout.top_button_count >= 11U &&
+                    verify_button_group_bounds_and_disjoint(&state.ui_font, layout.top_buttons, layout.top_button_count, layout.top_bar, "top_bar"),
+                    "single-row top bar buttons fit with zero overflow and zero overlap"
+                )) {
+                goto cleanup;
+            }
+            if (!assert_condition(
+                    layout.rail_button_count == 15U &&
+                    verify_button_group_bounds_and_disjoint(&state.ui_font, layout.rail_buttons, layout.rail_button_count, layout.left_rail, "left_rail"),
+                    "left tool rail buttons (9 tools + 4 transforms + 2 actions) fit cleanly"
+                )) {
+                goto cleanup;
+            }
+            if (!assert_condition(
+                    layout.slider_track.width >= 80 &&
+                    layout.slider_track.y >= layout.bottom_bar.y &&
+                    layout.slider_track.y + layout.slider_track.height <= layout.bottom_bar.y + layout.bottom_bar.height,
+                    "bottom simulator slider fits inside bottom bar"
+                )) {
+                goto cleanup;
+            }
+
+            /* Exercise full render including Cut box dimensions badge and Ukrainian Cyrillic status. */
+            state.active_tool = TOOL_CUT_OUT;
+            state.has_box_selection = true;
+            state.is_dragging_box = true;
+            state.box_start_x = state.design.minimum_x;
+            state.box_start_y = state.design.minimum_y;
+            state.box_end_x = state.design.minimum_x + 18 * 6;
+            state.box_end_y = state.design.minimum_y + 18 * 4;
+            fit_camera_to_design(&state, width, height);
+            render_editor_frame(&canvas, &state);
+            state.is_dragging_box = false;
+            state.has_box_selection = false;
+        }
+    }
+
+    /* Verify antialiased FreeType Latin + Ukrainian Cyrillic measurement and rendering. */
+    free_pixel_canvas(&canvas);
+    if (!assert_condition(init_pixel_canvas(&canvas, 480, 64), "init Cyrillic text canvas")) {
+        goto cleanup;
+    }
+    const char *ukrainian_sample = "Вишивка Є Ї Ґ є і ї ґ";
+    const int32_t measured_width = measure_ui_text_width(&state.ui_font, ukrainian_sample);
+    if (!assert_condition(
+            measured_width >= 100 && measured_width <= 420,
+            "UTF-8 Cyrillic string measures to reasonable proportional width"
+        )) {
+        goto cleanup;
+    }
+    const uint32_t bg = pack_rgb_pixel(20U, 22U, 26U);
+    const uint32_t fg = pack_rgb_pixel(255U, 255U, 255U);
+    draw_filled_rectangle(&canvas, 0, 0, canvas.width, canvas.height, bg);
+    draw_ui_text_vcentered(&canvas, &state.ui_font, 10, 0, canvas.height, ukrainian_sample, fg);
+    const size_t lit_pixels = count_non_background_pixels(&canvas, bg);
+    const size_t aa_pixels = count_antialiased_pixels(&canvas, bg, fg);
+    if (!assert_condition(lit_pixels > 400U, "Ukrainian Cyrillic glyphs render visible pixels")) {
+        goto cleanup;
+    }
+    if (state.ui_font.using_freetype) {
+        if (!assert_condition(
+                aa_pixels > 200U,
+                "FreeType UI font produces smooth antialiased edge pixels"
+            )) {
+            goto cleanup;
+        }
+    }
+
+    /* Verify HiDPI 2.0x scaling rebakes native 32px glyphs and keeps layout clean. */
+    const int32_t base_cap_height = state.ui_font.cap_height;
+    state.right_panel_collapsed = false;
+    editor_set_ui_scale(&state, 2.0);
+    if (!assert_condition(
+            state.ui_font.pixel_size == UI_FONT_BASE_PIXEL_SIZE * 2 &&
+            state.ui_font.cap_height > base_cap_height,
+            "HiDPI 2x scales native font rasterization and cap height"
+        )) {
+        goto cleanup;
+    }
+    const EditorLayout hidpi_layout = compute_editor_layout(&state, 3840, 2160);
+    if (!assert_condition(
+            hidpi_layout.top_bar.height == TOP_BAR_HEIGHT * 2 &&
+            hidpi_layout.left_rail.width == LEFT_RAIL_WIDTH * 2 &&
+            hidpi_layout.right_panel.width == RIGHT_PANEL_WIDTH * 2 &&
+            hidpi_layout.bottom_bar.height == BOTTOM_BAR_HEIGHT * 2 &&
+            verify_button_group_bounds_and_disjoint(&state.ui_font, hidpi_layout.top_buttons, hidpi_layout.top_button_count, hidpi_layout.top_bar, "hidpi_top_bar") &&
+            verify_button_group_bounds_and_disjoint(&state.ui_font, hidpi_layout.rail_buttons, hidpi_layout.rail_button_count, hidpi_layout.left_rail, "hidpi_left_rail") &&
+            verify_button_group_bounds_and_disjoint(&state.ui_font, hidpi_layout.prop_buttons, hidpi_layout.prop_button_count, hidpi_layout.right_panel, "hidpi_right_panel"),
+            "HiDPI 2x layout scales panels and fits all labels with zero overflow"
+        )) {
+        goto cleanup;
+    }
+
+    /* Verify built-in 8x8 bitmap fallback when no system font path is available. */
+    const bool loaded_missing =
+        init_ui_font_with_path(&fallback_font, "/nonexistent/embroidery_missing_font.ttf", UI_FONT_BASE_PIXEL_SIZE);
+    if (!assert_condition(
+            !loaded_missing && !fallback_font.using_freetype && fallback_font.alpha_pixels == nullptr,
+            "missing font path cleanly activates built-in 8x8 fallback without errors"
+        )) {
+        goto cleanup;
+    }
+    if (!assert_condition(
+            measure_ui_text_width(&fallback_font, ukrainian_sample) == 21 * 14,
+            "fallback 8x8 font measures UTF-8 Ukrainian text by codepoint count"
+        )) {
+        goto cleanup;
+    }
+    draw_filled_rectangle(&canvas, 0, 0, canvas.width, canvas.height, bg);
+    draw_ui_text(&canvas, &fallback_font, 10, 16, ukrainian_sample, fg);
+    const size_t fallback_pixels = count_non_background_pixels(&canvas, bg);
+    if (!assert_condition(fallback_pixels > 500U, "fallback 8x8 font renders visible Ukrainian glyphs")) {
+        goto cleanup;
+    }
+
+    printf(
+        "[PASS] Stage 3 layouts (1920x1080, 1280x720, 960x1080, HiDPI 2x) + UI font (ft=%d, lit=%zu px, aa=%zu px, fallback=%zu px)\n",
+        (int)state.ui_font.using_freetype,
+        lit_pixels,
+        aa_pixels,
+        fallback_pixels
+    );
+    passed = true;
+
+cleanup:
+    free_ui_font(&fallback_font);
+    free_pixel_canvas(&canvas);
+    free_editor_state(&state);
+    return passed;
+}
+
+static bool is_valid_sdl_dialog_filter_char(char character) {
+    const bool is_lower = (character >= 'a' && character <= 'z');
+    const bool is_upper = (character >= 'A' && character <= 'Z');
+    const bool is_digit = (character >= '0' && character <= '9');
+    const bool is_punct = (character == '_' || character == '.' || character == '-');
+    return is_lower || is_upper || is_digit || is_punct;
+}
+
+/* Matches SDL3 SDL_DialogFileFilter validation: single "*" or ";"-delimited [a-zA-Z0-9_.-]+ tokens. */
+static bool is_valid_sdl_dialog_filter_pattern(const char *pattern) {
+    if (pattern == nullptr || pattern[0] == '\0') {
+        return false;
+    }
+    if (strcmp(pattern, "*") == 0) {
+        return true;
+    }
+
+    size_t token_length = 0U;
+    for (size_t char_index = 0U; pattern[char_index] != '\0'; char_index += 1U) {
+        const char character = pattern[char_index];
+        if (character == ';') {
+            if (token_length == 0U) {
+                return false;
+            }
+            token_length = 0U;
+            continue;
+        }
+        if (!is_valid_sdl_dialog_filter_char(character)) {
+            return false;
+        }
+        token_length += 1U;
+    }
+    return token_length > 0U;
+}
+
+static bool test_sdl_dialog_file_filters(void) {
+    for (size_t filter_index = 0U; filter_index < OPEN_DIALOG_FILTER_COUNT; filter_index += 1U) {
+        const DialogFilterSpec spec = open_dialog_filters[filter_index];
+        if (!assert_condition(
+                spec.name != nullptr && spec.name[0] != '\0' &&
+                is_valid_sdl_dialog_filter_pattern(spec.pattern),
+                "open dialog filter obeys SDL3 SDL_DialogFileFilter pattern rules"
+            )) {
+            return false;
+        }
+    }
+    for (size_t filter_index = 0U; filter_index < SAVE_DIALOG_FILTER_COUNT; filter_index += 1U) {
+        const DialogFilterSpec spec = save_dialog_filters[filter_index];
+        if (!assert_condition(
+                spec.name != nullptr && spec.name[0] != '\0' &&
+                is_valid_sdl_dialog_filter_pattern(spec.pattern),
+                "save dialog filter obeys SDL3 SDL_DialogFileFilter pattern rules"
+            )) {
+            return false;
+        }
+    }
+
+    if (!assert_condition(
+            strcmp(open_dialog_filters[0].name, "Embroidery files") == 0 &&
+            strcmp(open_dialog_filters[0].pattern, "jef;pes;pec;dst") == 0 &&
+            strcmp(open_dialog_filters[1].name, "All files") == 0 &&
+            strcmp(open_dialog_filters[1].pattern, "*") == 0,
+            "open dialog filters match expected Embroidery files + All files specs"
+        )) {
+        return false;
+    }
+    if (!assert_condition(
+            strcmp(save_dialog_filters[0].name, "JEF embroidery") == 0 &&
+            strcmp(save_dialog_filters[0].pattern, "jef") == 0 &&
+            strcmp(save_dialog_filters[1].name, "All files") == 0 &&
+            strcmp(save_dialog_filters[1].pattern, "*") == 0,
+            "save dialog filters match expected JEF embroidery + All files specs"
+        )) {
+        return false;
+    }
+
+    static const char *const invalid_patterns[9] = {
+        nullptr,
+        "",
+        "jef;jef+;pes;pec;dst",
+        ";jef",
+        "jef;",
+        "jef;;pes",
+        "*.jef",
+        "*;jef",
+        "jef pes"
+    };
+    for (size_t case_index = 0U; case_index < 9U; case_index += 1U) {
+        if (!assert_condition(
+                !is_valid_sdl_dialog_filter_pattern(invalid_patterns[case_index]),
+                "SDL3 dialog filter validator rejects invalid pattern"
+            )) {
+            return false;
+        }
+    }
+
+    printf("[PASS] SDL3 dialog file filter pattern validation\n");
+    return true;
+}
+
 int main(void) {
     if (!test_invalid_and_corrupt_inputs()) {
         return EXIT_FAILURE;
@@ -1575,6 +2163,15 @@ int main(void) {
         return EXIT_FAILURE;
     }
     if (!test_headless_render_modes()) {
+        return EXIT_FAILURE;
+    }
+    if (!test_stage2_caches_and_cow_history()) {
+        return EXIT_FAILURE;
+    }
+    if (!test_stage3_headless_layouts_and_cyrillic()) {
+        return EXIT_FAILURE;
+    }
+    if (!test_sdl_dialog_file_filters()) {
         return EXIT_FAILURE;
     }
     if (!test_optional_real_directory()) {
