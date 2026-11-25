@@ -83,7 +83,35 @@ typedef struct {
     BlockDedupTable *block_dedup;
 } DesignRenderParams;
 
-extern const HoopPreset janome_550e_hoops[HOOP_PRESET_COUNT];
+typedef struct {
+    PixelCanvas buffer;
+    int32_t viewport_width;
+    int32_t viewport_height;
+    uint64_t design_revision;
+    uint64_t view_revision;
+    uint64_t mask_revision;
+    bool valid;
+    const uint32_t *last_target_pixels;
+    int32_t last_target_width;
+    int32_t last_target_height;
+    int32_t last_viewport_left;
+    int32_t last_viewport_top;
+    uint64_t last_ui_signature;
+    bool last_modal_was_open;
+    bool last_had_start_screen;
+    bool has_prev_overlay;
+    int32_t prev_overlay_min_x;
+    int32_t prev_overlay_min_y;
+    int32_t prev_overlay_max_x;
+    int32_t prev_overlay_max_y;
+    bool has_dirty_rect;
+    int32_t dirty_min_x;
+    int32_t dirty_min_y;
+    int32_t dirty_max_x;
+    int32_t dirty_max_y;
+} StitchLayerCache;
+
+extern const HoopPreset standard_hoop_presets[HOOP_PRESET_COUNT];
 extern const double thread_thickness_units[THREAD_THICKNESS_PRESET_COUNT];
 extern const char *const thread_thickness_labels[THREAD_THICKNESS_PRESET_COUNT];
 
@@ -91,6 +119,9 @@ bool init_pixel_canvas(PixelCanvas *canvas, int32_t width, int32_t height);
 void free_pixel_canvas(PixelCanvas *canvas);
 bool init_block_dedup_table(BlockDedupTable *table);
 void free_block_dedup_table(BlockDedupTable *table);
+void init_stitch_layer_cache(StitchLayerCache *cache);
+void free_stitch_layer_cache(StitchLayerCache *cache);
+void invalidate_stitch_layer_cache(StitchLayerCache *cache);
 
 uint32_t pack_rgb_pixel(uint8_t red, uint8_t green, uint8_t blue);
 uint32_t compute_rgb_luminance(RgbColor color);
@@ -210,6 +241,44 @@ void render_design_chains(
     PixelCanvas *canvas,
     const StitchDesign *design,
     const DesignRenderParams *params
+);
+bool ensure_stitch_layer_cache(
+    StitchLayerCache *cache,
+    const StitchDesign *design,
+    const DesignRenderParams *params,
+    uint64_t design_revision,
+    uint64_t view_revision,
+    uint64_t mask_revision,
+    bool show_grid,
+    size_t hoop_preset_index,
+    bool hoop_rotated,
+    bool *rebuilt_out
+);
+void blit_stitch_layer_cache(
+    PixelCanvas *destination,
+    const StitchLayerCache *cache,
+    RenderViewport viewport
+);
+void blit_stitch_layer_cache_rect(
+    PixelCanvas *destination,
+    const StitchLayerCache *cache,
+    RenderViewport viewport,
+    int32_t screen_min_x,
+    int32_t screen_min_y,
+    int32_t screen_max_x,
+    int32_t screen_max_y
+);
+void render_chain_subset_overlay(
+    PixelCanvas *canvas,
+    const StitchDesign *design,
+    const DesignRenderParams *params,
+    const size_t *chain_indices,
+    size_t chain_count,
+    uint8_t visual_flags,
+    int32_t *bounds_min_x_out,
+    int32_t *bounds_min_y_out,
+    int32_t *bounds_max_x_out,
+    int32_t *bounds_max_y_out
 );
 
 #endif

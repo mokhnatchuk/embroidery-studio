@@ -7,23 +7,66 @@
 
 constexpr int32_t WINDOW_INITIAL_WIDTH = 1920;
 constexpr int32_t WINDOW_INITIAL_HEIGHT = 1080;
-constexpr int32_t FONT_SCALE = 2;
-constexpr int32_t FONT_GLYPH_WIDTH = 8 * FONT_SCALE;
-constexpr int32_t FONT_GLYPH_HEIGHT = 8 * FONT_SCALE;
-constexpr int32_t LEFT_PANEL_WIDTH = 360;
-constexpr int32_t COLOR_ROW_HEIGHT = 40;
-constexpr int32_t BOTTOM_PANEL_HEIGHT = 104;
-constexpr int32_t TOOLBAR_BUTTON_HEIGHT = 30;
-constexpr int32_t TOOLBAR_BUTTON_PAD = 8;
-constexpr int32_t TOOLBAR_BUTTON_GAP = 3;
-constexpr int32_t TOOLBAR_ROW_GAP = 6;
-constexpr int32_t TOOLBAR_PADDING = 6;
-constexpr size_t MAX_TOOLBAR_BUTTONS = 44U;
+constexpr int32_t UI_FONT_BASE_PIXEL_SIZE = 16;
+constexpr int32_t UI_FONT_MIN_PIXEL_SIZE = 12;
+constexpr int32_t UI_FONT_MAX_PIXEL_SIZE = 48;
+constexpr size_t UI_FONT_ASCII_COUNT = 95U;
+constexpr size_t UI_FONT_CYRILLIC_COUNT = 96U;
+constexpr size_t UI_FONT_EXTRA_COUNT = 12U;
+constexpr size_t UI_FONT_GLYPH_COUNT =
+    UI_FONT_ASCII_COUNT + UI_FONT_CYRILLIC_COUNT + UI_FONT_EXTRA_COUNT;
+constexpr int32_t TOP_BAR_HEIGHT = 38;
+constexpr int32_t LEFT_RAIL_WIDTH = 76;
+constexpr int32_t RIGHT_PANEL_WIDTH = 268;
+constexpr int32_t BOTTOM_BAR_HEIGHT = 60;
+constexpr int32_t COLOR_ROW_HEIGHT = 36;
+constexpr size_t MAX_TOP_BUTTONS = 16U;
+constexpr size_t MAX_RAIL_BUTTONS = 20U;
+constexpr size_t MAX_PROP_BUTTONS = 20U;
 constexpr size_t MAX_STRIP_BUTTONS = 36U;
-constexpr size_t MAX_DIALOG_BUTTONS = 12U;
 constexpr size_t MAX_STRIP_HISTORY_STATES = 16U;
-constexpr int32_t FILE_ROW_HEIGHT = 30;
-constexpr uint32_t DOUBLE_CLICK_MS = 400U;
+constexpr size_t OPEN_DIALOG_FILTER_COUNT = 2U;
+constexpr size_t SAVE_DIALOG_FILTER_COUNT = 2U;
+
+static_assert(UI_FONT_GLYPH_COUNT == 203U, "UI font atlas must hold 203 pre-baked glyphs");
+
+typedef struct {
+    uint32_t atlas_offset;
+    uint16_t width;
+    uint16_t height;
+    int16_t bitmap_left;
+    int16_t bitmap_top;
+    int16_t advance_x;
+    uint16_t valid;
+} UiGlyphMetric;
+
+typedef struct {
+    uint8_t *alpha_pixels;
+    size_t alpha_byte_count;
+    UiGlyphMetric glyphs[UI_FONT_GLYPH_COUNT];
+    int32_t pixel_size;
+    int32_t ascender;
+    int32_t descender;
+    int32_t cap_height;
+    int32_t line_height;
+    int32_t fallback_scale;
+    bool using_freetype;
+} UiFont;
+
+typedef struct {
+    const char *name;
+    const char *pattern;
+} DialogFilterSpec;
+
+extern const DialogFilterSpec open_dialog_filters[OPEN_DIALOG_FILTER_COUNT];
+extern const DialogFilterSpec save_dialog_filters[SAVE_DIALOG_FILTER_COUNT];
+
+typedef struct {
+    int32_t x;
+    int32_t y;
+    int32_t width;
+    int32_t height;
+} UiRect;
 
 typedef enum : uint8_t {
     TOOL_SELECT_ELEMENT = 0U,
@@ -73,7 +116,9 @@ typedef enum : uint8_t {
     COMMAND_MERGE_FILE_DIALOG = 32U,
     COMMAND_SAVE_AS_DIALOG = 33U,
     COMMAND_CYCLE_VIEW_MODE = 34U,
-    COMMAND_CYCLE_THREAD_THICKNESS = 35U
+    COMMAND_CYCLE_THREAD_THICKNESS = 35U,
+    COMMAND_TOGGLE_RIGHT_PANEL = 36U,
+    COMMAND_ADD_COLOR_BLOCK = 37U
 } ToolbarCommand;
 
 typedef enum : uint8_t {
@@ -109,33 +154,15 @@ typedef enum : uint8_t {
 } PaletteModalTarget;
 
 typedef enum : uint8_t {
-    FILE_DIALOG_CLOSED = 0U,
-    FILE_DIALOG_OPEN = 1U,
-    FILE_DIALOG_MERGE = 2U,
-    FILE_DIALOG_SAVE_AS = 3U,
-    FILE_DIALOG_STRIP_SAVE_AS = 4U
-} FileDialogMode;
-
-typedef enum : uint8_t {
-    DIALOG_CMD_NONE = 0U,
-    DIALOG_CMD_PARENT = 1U,
-    DIALOG_CMD_HOME = 2U,
-    DIALOG_CMD_DOWNLOADS = 3U,
-    DIALOG_CMD_CONFIRM = 4U,
-    DIALOG_CMD_CANCEL = 5U
-} FileDialogCommand;
-
-typedef enum : uint8_t {
-    LEFT_PANEL_HIT_NONE = 0U,
-    LEFT_PANEL_HIT_PANEL_EMPTY = 1U,
-    LEFT_PANEL_HIT_ADD_COLOR = 2U,
-    LEFT_PANEL_HIT_SELECT_BLOCK = 3U,
-    LEFT_PANEL_HIT_TOGGLE_VISIBILITY = 4U,
-    LEFT_PANEL_HIT_MOVE_UP = 5U,
-    LEFT_PANEL_HIT_MOVE_DOWN = 6U,
-    LEFT_PANEL_HIT_RECOLOR_BLOCK = 7U,
-    LEFT_PANEL_HIT_DELETE_BLOCK = 8U
-} LeftPanelHitKind;
+    COLOR_LIST_HIT_NONE = 0U,
+    COLOR_LIST_HIT_PANEL_EMPTY = 1U,
+    COLOR_LIST_HIT_SELECT_BLOCK = 2U,
+    COLOR_LIST_HIT_TOGGLE_VISIBILITY = 3U,
+    COLOR_LIST_HIT_MOVE_UP = 4U,
+    COLOR_LIST_HIT_MOVE_DOWN = 5U,
+    COLOR_LIST_HIT_RECOLOR_BLOCK = 6U,
+    COLOR_LIST_HIT_DELETE_BLOCK = 7U
+} ColorListHitKind;
 
 typedef struct {
     int32_t left_x;
@@ -153,31 +180,25 @@ typedef struct {
 } UiButton;
 
 typedef struct {
+    UiRect top_bar;
+    UiRect left_rail;
+    UiRect right_panel;
+    UiRect bottom_bar;
+    UiRect viewport;
+    UiRect slider_track;
+    UiRect colors_list_rect;
+    UiButton top_buttons[MAX_TOP_BUTTONS];
+    size_t top_button_count;
+    UiButton rail_buttons[MAX_RAIL_BUTTONS];
+    size_t rail_button_count;
+    UiButton prop_buttons[MAX_PROP_BUTTONS];
+    size_t prop_button_count;
+} EditorLayout;
+
+typedef struct {
     StripPattern states[MAX_STRIP_HISTORY_STATES];
     size_t state_count;
 } StripHistory;
-
-typedef struct {
-    char name[256];
-    bool is_directory;
-    uint64_t file_size_bytes;
-} FileBrowserEntry;
-
-typedef struct {
-    FileDialogMode mode;
-    char current_directory[MAX_PATH_BUFFER];
-    char filename_input[256];
-    FileBrowserEntry *entries;
-    size_t entry_count;
-    size_t entry_capacity;
-    size_t selected_index;
-    int32_t scroll_offset;
-    uint32_t last_click_ticks;
-    size_t last_click_index;
-    bool confirm_overwrite;
-    char pending_overwrite_path[MAX_PATH_BUFFER];
-    char error_text[128];
-} FileDialogState;
 
 typedef struct {
     int32_t modal_left;
@@ -211,23 +232,6 @@ typedef struct {
 } StripModalLayout;
 
 typedef struct {
-    int32_t modal_left;
-    int32_t modal_top;
-    int32_t modal_width;
-    int32_t modal_height;
-    int32_t list_left;
-    int32_t list_top;
-    int32_t list_width;
-    int32_t list_height;
-    int32_t input_left;
-    int32_t input_top;
-    int32_t input_width;
-    int32_t input_height;
-    UiButton buttons[MAX_DIALOG_BUTTONS];
-    size_t button_count;
-} FileDialogLayout;
-
-typedef struct {
     int32_t card_left;
     int32_t card_top;
     int32_t card_width;
@@ -242,6 +246,16 @@ typedef struct {
     StitchDesign design;
     EditHistory history;
     CrossGridInfo grid;
+    ScratchArena scratch;
+    DesignSpatialIndex spatial_index;
+    CrossClusterCache cross_cache;
+    StitchLayerCache stitch_cache;
+    UiFont ui_font;
+    double ui_scale;
+    uint64_t design_revision;
+    uint64_t mask_revision;
+    bool is_dirty;
+    bool right_panel_collapsed;
 
     /* Live preview mask computed by the exact same ops function as Enter apply. */
     uint8_t *edit_preview_keep_mask;
@@ -256,8 +270,12 @@ typedef struct {
     uint8_t *hover_mask;
     size_t hover_mask_length;
     size_t hover_seed_chain;
+    size_t hover_component_id;
     bool has_hover_cross_box;
     CutRectangle hover_cross_box;
+    int32_t last_draw_cursor_column;
+    int32_t last_draw_cursor_row;
+    bool has_draw_cursor_cell;
 
     StitchDesign floating_fragment;
     bool has_floating_fragment;
@@ -297,10 +315,6 @@ typedef struct {
 
     double simulator_percent;
     bool is_dragging_slider;
-    int32_t slider_left_x;
-    int32_t slider_right_x;
-    int32_t slider_top_y;
-    int32_t slider_bottom_y;
 
     CameraView camera;
     bool is_panning;
@@ -310,10 +324,6 @@ typedef struct {
     int32_t mouse_screen_x;
     int32_t mouse_screen_y;
     int32_t color_scroll_offset;
-
-    int32_t toolbar_height;
-    UiButton toolbar_buttons[MAX_TOOLBAR_BUTTONS];
-    size_t toolbar_button_count;
 
     PaletteModalTarget palette_target;
     size_t palette_target_block_index;
@@ -327,13 +337,14 @@ typedef struct {
     bool strip_is_erasing;
     bool strip_stroke_pushed_undo;
 
-    FileDialogState file_dialog;
-    bool text_input_active;
-
     char status_message[256];
     bool needs_redraw;
     bool should_quit;
 } EditorState;
+
+bool init_ui_font(UiFont *font, int32_t pixel_size);
+bool init_ui_font_with_path(UiFont *font, const char *font_path, int32_t pixel_size);
+void free_ui_font(UiFont *font);
 
 bool point_is_in_box(
     int32_t point_x,
@@ -343,16 +354,35 @@ bool point_is_in_box(
     int32_t box_width,
     int32_t box_height
 );
-void draw_bitmap_text_2x(
+bool rect_contains_point(UiRect rect, int32_t point_x, int32_t point_y);
+int32_t measure_ui_text_width(const UiFont *font, const char *text);
+void draw_ui_text(
     PixelCanvas *canvas,
+    const UiFont *font,
     int32_t origin_x,
     int32_t origin_y,
     const char *text,
     uint32_t packed_color
 );
-int32_t measure_text_2x_width(const char *text);
+void draw_ui_text_vcentered(
+    PixelCanvas *canvas,
+    const UiFont *font,
+    int32_t origin_x,
+    int32_t box_top,
+    int32_t box_height,
+    const char *text,
+    uint32_t packed_color
+);
+void draw_ui_text_centered(
+    PixelCanvas *canvas,
+    const UiFont *font,
+    UiRect box,
+    const char *text,
+    uint32_t packed_color
+);
 void draw_ui_button(
     PixelCanvas *canvas,
+    const UiFont *font,
     const UiButton *button,
     int32_t mouse_x,
     int32_t mouse_y
@@ -360,6 +390,17 @@ void draw_ui_button(
 
 void init_default_editor_state(EditorState *state);
 void free_editor_state(EditorState *state);
+void editor_set_ui_scale(EditorState *state, double ui_scale);
+int32_t get_editor_color_row_height(const EditorState *state);
+void editor_mark_design_changed(EditorState *state, bool mark_dirty);
+void editor_ensure_spatial_index(EditorState *state);
+void editor_update_canvas_hover(
+    EditorState *state,
+    int32_t mouse_x,
+    int32_t mouse_y,
+    int32_t window_width,
+    int32_t window_height
+);
 void set_status_message(EditorState *state, const char *message);
 void clear_segment_selection(EditorState *state);
 void clear_hover_preview(EditorState *state);
@@ -369,6 +410,11 @@ bool ensure_selection_mask_allocated(EditorState *state);
 void recount_selected_segments(EditorState *state);
 void strip_history_push(EditorState *state);
 
+EditorLayout compute_editor_layout(
+    const EditorState *state,
+    int32_t window_width,
+    int32_t window_height
+);
 RenderViewport get_editor_viewport(
     const EditorState *state,
     int32_t window_width,
@@ -405,48 +451,36 @@ bool tool_uses_box_preview(EditorTool tool);
 EditOperationKind tool_to_edit_operation(EditorTool tool);
 void refresh_live_preview(EditorState *state);
 bool should_show_start_screen(const EditorState *state);
-void update_slider_from_mouse(EditorState *state, int32_t mouse_x);
-
+void update_slider_from_layout(EditorState *state, const EditorLayout *layout, int32_t mouse_x);
 const char *basename_of_path(const char *path);
-bool directory_exists(const char *directory_path);
-bool file_has_embroidery_extension(const char *file_name);
-bool load_file_browser_directory(EditorState *state, const char *directory_path);
-void close_file_dialog_state(EditorState *state);
-void open_file_dialog_state(EditorState *state, FileDialogMode mode);
-void file_dialog_navigate_parent(EditorState *state);
-void file_dialog_navigate_home(EditorState *state);
-void file_dialog_navigate_downloads(EditorState *state);
-void file_dialog_append_text_input(EditorState *state, const char *utf8_text);
-void file_dialog_backspace_input(EditorState *state);
 
-void layout_toolbar_buttons(EditorState *state, int32_t window_width);
 StartScreenLayout compute_start_screen_layout(
     const EditorState *state,
     int32_t window_width,
     int32_t window_height
 );
-PaletteModalLayout compute_palette_modal_layout(int32_t window_width, int32_t window_height);
+PaletteModalLayout compute_palette_modal_layout(
+    const EditorState *state,
+    int32_t window_width,
+    int32_t window_height
+);
 StripModalLayout compute_strip_modal_layout(
     const EditorState *state,
     int32_t window_width,
     int32_t window_height
 );
-FileDialogLayout compute_file_dialog_layout(
-    const EditorState *state,
-    int32_t window_width,
-    int32_t window_height
-);
 
-uint8_t hit_test_toolbar(const EditorState *state, int32_t mouse_x, int32_t mouse_y);
-bool hit_test_slider(const EditorState *state, int32_t mouse_x, int32_t mouse_y);
-LeftPanelHitKind hit_test_left_panel(
+uint8_t hit_test_editor_buttons(const EditorLayout *layout, int32_t mouse_x, int32_t mouse_y);
+bool hit_test_slider_layout(const EditorLayout *layout, int32_t mouse_x, int32_t mouse_y);
+ColorListHitKind hit_test_color_list(
     const EditorState *state,
+    const EditorLayout *layout,
     int32_t mouse_x,
     int32_t mouse_y,
-    int32_t window_height,
     size_t *block_index_out
 );
 bool hit_test_palette_modal(
+    const EditorState *state,
     int32_t mouse_x,
     int32_t mouse_y,
     int32_t window_width,
@@ -465,18 +499,6 @@ bool hit_test_strip_editor_cell(
     int32_t mouse_y,
     int32_t *column_out,
     int32_t *row_out
-);
-uint8_t hit_test_file_dialog_button(
-    const FileDialogLayout *layout,
-    int32_t mouse_x,
-    int32_t mouse_y
-);
-bool hit_test_file_dialog_entry(
-    const EditorState *state,
-    const FileDialogLayout *layout,
-    int32_t mouse_x,
-    int32_t mouse_y,
-    size_t *entry_index_out
 );
 
 void render_editor_frame(PixelCanvas *canvas, EditorState *state);

@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-const HoopPreset janome_550e_hoops[HOOP_PRESET_COUNT] = {
+const HoopPreset standard_hoop_presets[HOOP_PRESET_COUNT] = {
     {"Off", 0, 0},
     {"140x140", 1400, 1400},
     {"140x200", 1400, 2000},
@@ -736,7 +736,7 @@ bool get_hoop_dimensions(
     if (hoop_preset_index == 0U || hoop_preset_index >= HOOP_PRESET_COUNT) {
         return false;
     }
-    const HoopPreset preset = janome_550e_hoops[hoop_preset_index];
+    const HoopPreset preset = standard_hoop_presets[hoop_preset_index];
     if (hoop_rotated) {
         *width_units_out = preset.height_units;
         *height_units_out = preset.width_units;
@@ -1448,73 +1448,99 @@ static void render_design_blocks(
             draw_line_clipped(canvas, previous_end_x, previous_end_y, first_screen_x, first_screen_y, jump_color, 4);
         }
 
-        int32_t start_x = first_screen_x;
-        int32_t start_y = first_screen_y;
+        const bool track_needle_tip = (params->maximum_stitches_to_draw < SIZE_MAX);
         for (size_t local_index = 0U; local_index < chain_segments; local_index += 1U) {
             if (drawn_stitch_count >= params->maximum_stitches_to_draw) {
                 break;
             }
             const StitchPoint start_point = chain_points[local_index];
             const StitchPoint end_point = chain_points[local_index + 1U];
-            const int32_t end_x =
-                fast_round_to_int32(origin_screen_x + (double)(end_point.position_x + params->world_offset_x) * scale);
-            const int32_t end_y =
-                fast_round_to_int32(origin_screen_y + (double)(end_point.position_y + params->world_offset_y) * scale);
             drawn_stitch_count += 1U;
-            needle_tip_x = end_x;
-            needle_tip_y = end_y;
-            has_needle_tip = true;
 
-            if (!is_cross_diagonal_for_pitch(start_point, end_point, pitch)) {
-                const size_t current_flat = flat_segment_index + local_index;
-                uint8_t visual_flags = 1U;
-                if (params->selection_mask != nullptr &&
-                    current_flat < params->selection_mask_length &&
-                    params->selection_mask[current_flat] != 0U) {
-                    visual_flags = 3U;
-                } else if (params->hover_mask != nullptr &&
-                           current_flat < params->hover_mask_length &&
-                           params->hover_mask[current_flat] != 0U) {
-                    visual_flags = 2U;
-                } else if (params->keep_preview_mask != nullptr &&
-                           current_flat < params->keep_preview_mask_length &&
-                           params->keep_preview_mask[current_flat] == 0U) {
-                    visual_flags = 0U;
+            if (is_cross_diagonal_for_pitch(start_point, end_point, pitch)) {
+                if (track_needle_tip && drawn_stitch_count == params->maximum_stitches_to_draw) {
+                    needle_tip_x = fast_round_to_int32(
+                        origin_screen_x + (double)(end_point.position_x + params->world_offset_x) * scale
+                    );
+                    needle_tip_y = fast_round_to_int32(
+                        origin_screen_y + (double)(end_point.position_y + params->world_offset_y) * scale
+                    );
+                    has_needle_tip = true;
                 }
-                draw_blocks_non_diagonal_segment(
-                    canvas,
-                    params,
-                    chain.color_block_index,
-                    start_point,
-                    end_point,
-                    start_x,
-                    start_y,
-                    end_x,
-                    end_y,
-                    pitch,
-                    visual_flags,
-                    line_color,
-                    dimmed_color,
-                    draw_thick_outline
-                );
+                continue;
             }
 
-            start_x = end_x;
-            start_y = end_y;
+            const int32_t start_x = fast_round_to_int32(
+                origin_screen_x + (double)(start_point.position_x + params->world_offset_x) * scale
+            );
+            const int32_t start_y = fast_round_to_int32(
+                origin_screen_y + (double)(start_point.position_y + params->world_offset_y) * scale
+            );
+            const int32_t end_x = fast_round_to_int32(
+                origin_screen_x + (double)(end_point.position_x + params->world_offset_x) * scale
+            );
+            const int32_t end_y = fast_round_to_int32(
+                origin_screen_y + (double)(end_point.position_y + params->world_offset_y) * scale
+            );
+            if (track_needle_tip) {
+                needle_tip_x = end_x;
+                needle_tip_y = end_y;
+                has_needle_tip = true;
+            }
+
+            const size_t current_flat = flat_segment_index + local_index;
+            uint8_t visual_flags = 1U;
+            if (params->selection_mask != nullptr &&
+                current_flat < params->selection_mask_length &&
+                params->selection_mask[current_flat] != 0U) {
+                visual_flags = 3U;
+            } else if (params->hover_mask != nullptr &&
+                       current_flat < params->hover_mask_length &&
+                       params->hover_mask[current_flat] != 0U) {
+                visual_flags = 2U;
+            } else if (params->keep_preview_mask != nullptr &&
+                       current_flat < params->keep_preview_mask_length &&
+                       params->keep_preview_mask[current_flat] == 0U) {
+                visual_flags = 0U;
+            }
+            draw_blocks_non_diagonal_segment(
+                canvas,
+                params,
+                chain.color_block_index,
+                start_point,
+                end_point,
+                start_x,
+                start_y,
+                end_x,
+                end_y,
+                pitch,
+                visual_flags,
+                line_color,
+                dimmed_color,
+                draw_thick_outline
+            );
         }
+
+        const StitchPoint tail_point = chain_points[chain_segments];
+        const int32_t last_screen_x = fast_round_to_int32(
+            origin_screen_x + (double)(tail_point.position_x + params->world_offset_x) * scale
+        );
+        const int32_t last_screen_y = fast_round_to_int32(
+            origin_screen_y + (double)(tail_point.position_y + params->world_offset_y) * scale
+        );
 
         if (params->draw_overlays && params->show_locks) {
             if (chain.start_was_cut) {
                 draw_lock_marker(canvas, first_screen_x, first_screen_y);
             }
             if (chain.end_was_cut && drawn_stitch_count < params->maximum_stitches_to_draw) {
-                draw_lock_marker(canvas, start_x, start_y);
+                draw_lock_marker(canvas, last_screen_x, last_screen_y);
             }
         }
 
         previous_block_index = chain.color_block_index;
-        previous_end_x = start_x;
-        previous_end_y = start_y;
+        previous_end_x = last_screen_x;
+        previous_end_y = last_screen_y;
         has_previous_end = true;
         flat_segment_index += chain_segments;
     }
@@ -1537,4 +1563,489 @@ void render_design_chains(
         return;
     }
     render_design_line_or_thread(canvas, design, params);
+}
+
+void init_stitch_layer_cache(StitchLayerCache *cache) {
+    *cache = (StitchLayerCache){};
+}
+
+void free_stitch_layer_cache(StitchLayerCache *cache) {
+    free_pixel_canvas(&cache->buffer);
+    *cache = (StitchLayerCache){};
+}
+
+void invalidate_stitch_layer_cache(StitchLayerCache *cache) {
+    cache->valid = false;
+}
+
+bool ensure_stitch_layer_cache(
+    StitchLayerCache *cache,
+    const StitchDesign *design,
+    const DesignRenderParams *params,
+    uint64_t design_revision,
+    uint64_t view_revision,
+    uint64_t mask_revision,
+    bool show_grid,
+    size_t hoop_preset_index,
+    bool hoop_rotated,
+    bool *rebuilt_out
+) {
+    if (rebuilt_out != nullptr) {
+        *rebuilt_out = false;
+    }
+    if (cache == nullptr || design == nullptr || params == nullptr ||
+        params->viewport.width <= 0 || params->viewport.height <= 0) {
+        return false;
+    }
+
+    if (cache->valid &&
+        cache->viewport_width == params->viewport.width &&
+        cache->viewport_height == params->viewport.height &&
+        cache->design_revision == design_revision &&
+        cache->view_revision == view_revision &&
+        cache->mask_revision == mask_revision) {
+        return true;
+    }
+
+    if (cache->buffer.pixels == nullptr ||
+        cache->buffer.width != params->viewport.width ||
+        cache->buffer.height != params->viewport.height) {
+        PixelCanvas resized = {};
+        if (!init_pixel_canvas(&resized, params->viewport.width, params->viewport.height)) {
+            return false;
+        }
+        free_pixel_canvas(&cache->buffer);
+        cache->buffer = resized;
+    }
+
+    reset_canvas_clip(&cache->buffer);
+    draw_filled_rectangle(
+        &cache->buffer,
+        0,
+        0,
+        cache->buffer.width,
+        cache->buffer.height,
+        pack_rgb_pixel(245U, 246U, 248U)
+    );
+
+    const RenderViewport local_viewport = {
+        .left = 0,
+        .top = 0,
+        .width = cache->buffer.width,
+        .height = cache->buffer.height
+    };
+    draw_cross_grid_background(&cache->buffer, local_viewport, params->camera, params->grid, show_grid);
+    draw_hoop_overlay(&cache->buffer, local_viewport, params->camera, design, hoop_preset_index, hoop_rotated);
+
+    if (design->chain_count > 0U) {
+        DesignRenderParams cached_params = *params;
+        cached_params.viewport = local_viewport;
+        cached_params.hover_mask = nullptr;
+        cached_params.hover_mask_length = 0U;
+        render_design_chains(&cache->buffer, design, &cached_params);
+    }
+
+    cache->viewport_width = params->viewport.width;
+    cache->viewport_height = params->viewport.height;
+    cache->design_revision = design_revision;
+    cache->view_revision = view_revision;
+    cache->mask_revision = mask_revision;
+    cache->valid = true;
+    if (rebuilt_out != nullptr) {
+        *rebuilt_out = true;
+    }
+    return true;
+}
+
+void blit_stitch_layer_cache_rect(
+    PixelCanvas *destination,
+    const StitchLayerCache *cache,
+    RenderViewport viewport,
+    int32_t screen_min_x,
+    int32_t screen_min_y,
+    int32_t screen_max_x,
+    int32_t screen_max_y
+) {
+    if (destination == nullptr || destination->pixels == nullptr ||
+        cache == nullptr || !cache->valid || cache->buffer.pixels == nullptr) {
+        return;
+    }
+
+    int32_t min_x = screen_min_x;
+    int32_t min_y = screen_min_y;
+    int32_t max_x = screen_max_x;
+    int32_t max_y = screen_max_y;
+
+    if (min_x < viewport.left) {
+        min_x = viewport.left;
+    }
+    if (min_y < viewport.top) {
+        min_y = viewport.top;
+    }
+    int32_t vp_right = viewport.left + viewport.width;
+    if (viewport.left + cache->buffer.width < vp_right) {
+        vp_right = viewport.left + cache->buffer.width;
+    }
+    if (destination->width < vp_right) {
+        vp_right = destination->width;
+    }
+    int32_t vp_bottom = viewport.top + viewport.height;
+    if (viewport.top + cache->buffer.height < vp_bottom) {
+        vp_bottom = viewport.top + cache->buffer.height;
+    }
+    if (destination->height < vp_bottom) {
+        vp_bottom = destination->height;
+    }
+    if (max_x > vp_right) {
+        max_x = vp_right;
+    }
+    if (max_y > vp_bottom) {
+        max_y = vp_bottom;
+    }
+    if (min_x < 0) {
+        min_x = 0;
+    }
+    if (min_y < 0) {
+        min_y = 0;
+    }
+    if (min_x >= max_x || min_y >= max_y) {
+        return;
+    }
+
+    const int32_t copy_width = max_x - min_x;
+    const int32_t src_offset_x = min_x - viewport.left;
+    const size_t row_bytes = (size_t)copy_width * sizeof(uint32_t);
+    const size_t destination_stride = (size_t)destination->width;
+    const size_t source_stride = (size_t)cache->buffer.width;
+
+    for (int32_t screen_y = min_y; screen_y < max_y; screen_y += 1) {
+        const int32_t src_y = screen_y - viewport.top;
+        uint32_t *destination_row =
+            destination->pixels + (size_t)screen_y * destination_stride + (size_t)min_x;
+        const uint32_t *source_row =
+            cache->buffer.pixels + (size_t)src_y * source_stride + (size_t)src_offset_x;
+        memcpy(destination_row, source_row, row_bytes);
+    }
+}
+
+void blit_stitch_layer_cache(
+    PixelCanvas *destination,
+    const StitchLayerCache *cache,
+    RenderViewport viewport
+) {
+    blit_stitch_layer_cache_rect(
+        destination,
+        cache,
+        viewport,
+        viewport.left,
+        viewport.top,
+        viewport.left + viewport.width,
+        viewport.top + viewport.height
+    );
+}
+
+static void expand_screen_rect_bounds(
+    bool *has_bounds,
+    int32_t *min_x,
+    int32_t *min_y,
+    int32_t *max_x,
+    int32_t *max_y,
+    int32_t rect_min_x,
+    int32_t rect_min_y,
+    int32_t rect_max_x,
+    int32_t rect_max_y
+) {
+    if (!(*has_bounds)) {
+        *min_x = rect_min_x;
+        *min_y = rect_min_y;
+        *max_x = rect_max_x;
+        *max_y = rect_max_y;
+        *has_bounds = true;
+        return;
+    }
+    if (rect_min_x < *min_x) {
+        *min_x = rect_min_x;
+    }
+    if (rect_min_y < *min_y) {
+        *min_y = rect_min_y;
+    }
+    if (rect_max_x > *max_x) {
+        *max_x = rect_max_x;
+    }
+    if (rect_max_y > *max_y) {
+        *max_y = rect_max_y;
+    }
+}
+
+void render_chain_subset_overlay(
+    PixelCanvas *canvas,
+    const StitchDesign *design,
+    const DesignRenderParams *params,
+    const size_t *chain_indices,
+    size_t chain_count,
+    uint8_t visual_flags,
+    int32_t *bounds_min_x_out,
+    int32_t *bounds_min_y_out,
+    int32_t *bounds_max_x_out,
+    int32_t *bounds_max_y_out
+) {
+    if (bounds_min_x_out != nullptr && bounds_min_y_out != nullptr &&
+        bounds_max_x_out != nullptr && bounds_max_y_out != nullptr) {
+        *bounds_min_x_out = 0;
+        *bounds_min_y_out = 0;
+        *bounds_max_x_out = 0;
+        *bounds_max_y_out = 0;
+    }
+    if (canvas == nullptr || canvas->pixels == nullptr || design == nullptr ||
+        params == nullptr || chain_indices == nullptr || chain_count == 0U) {
+        return;
+    }
+
+    const double scale = params->camera.pixels_per_unit;
+    const double origin_screen_x =
+        (double)params->viewport.left + (double)params->viewport.width * 0.5 -
+        params->camera.center_x * scale;
+    const double origin_screen_y =
+        (double)params->viewport.top + (double)params->viewport.height * 0.5 -
+        params->camera.center_y * scale;
+    bool has_drawn_bounds = false;
+    int32_t drawn_min_x = 0;
+    int32_t drawn_min_y = 0;
+    int32_t drawn_max_x = 0;
+    int32_t drawn_max_y = 0;
+
+    if (params->view_mode == VIEW_MODE_BLOCKS) {
+        int32_t pitch = params->grid.cross_pitch_units;
+        if (pitch < MIN_CROSS_PITCH_UNITS) {
+            pitch = DEFAULT_CROSS_PITCH_UNITS;
+        }
+        const double half_pitch_world = (double)pitch * 0.5;
+        const double cell_size_px = (double)pitch * scale;
+        const bool leave_gap = (cell_size_px >= 6.0);
+        const bool draw_light_border = (cell_size_px >= 4.5);
+        const bool draw_thick_outline = (scale >= 1.0);
+        reset_block_dedup_frame(params->block_dedup);
+
+        for (size_t subset_index = 0U; subset_index < chain_count; subset_index += 1U) {
+            const size_t chain_index = chain_indices[subset_index];
+            if (chain_index >= design->chain_count) {
+                continue;
+            }
+            const StitchChain chain = design->chains[chain_index];
+            if (chain.point_count < 2U || chain.color_block_index >= design->block_count ||
+                !design->blocks[chain.color_block_index].enabled) {
+                continue;
+            }
+            const RgbColor base_rgb = design->blocks[chain.color_block_index].display_color;
+            const uint32_t line_color = pack_rgb_pixel(base_rgb.red, base_rgb.green, base_rgb.blue);
+            const uint32_t dimmed_color = make_dimmed_color(base_rgb);
+            const StitchPoint *chain_points = &design->points[chain.point_offset];
+            const size_t chain_segments = chain.point_count - 1U;
+
+            for (size_t local_index = 0U; local_index < chain_segments; local_index += 1U) {
+                const StitchPoint start_point = chain_points[local_index];
+                const StitchPoint end_point = chain_points[local_index + 1U];
+                if (is_cross_diagonal_for_pitch(start_point, end_point, pitch)) {
+                    const int32_t center_x =
+                        (int32_t)(((int64_t)start_point.position_x + (int64_t)end_point.position_x) / 2LL);
+                    const int32_t center_y =
+                        (int32_t)(((int64_t)start_point.position_y + (int64_t)end_point.position_y) / 2LL);
+                    const double world_center_x = (double)(center_x + params->world_offset_x);
+                    const double world_center_y = (double)(center_y + params->world_offset_y);
+                    const int32_t left_x = fast_round_to_int32(origin_screen_x + (world_center_x - half_pitch_world) * scale);
+                    const int32_t right_x = fast_round_to_int32(origin_screen_x + (world_center_x + half_pitch_world) * scale);
+                    const int32_t top_y = fast_round_to_int32(origin_screen_y + (world_center_y - half_pitch_world) * scale);
+                    const int32_t bottom_y = fast_round_to_int32(origin_screen_y + (world_center_y + half_pitch_world) * scale);
+                    if (right_x < canvas->clip_min_x || left_x >= canvas->clip_max_x ||
+                        bottom_y < canvas->clip_min_y || top_y >= canvas->clip_max_y) {
+                        continue;
+                    }
+                    if (block_dedup_try_insert(params->block_dedup, chain.color_block_index, center_x, center_y, visual_flags)) {
+                        draw_cross_block_square(
+                            canvas,
+                            left_x,
+                            top_y,
+                            right_x,
+                            bottom_y,
+                            base_rgb,
+                            visual_flags,
+                            leave_gap,
+                            draw_light_border
+                        );
+                        expand_screen_rect_bounds(
+                            &has_drawn_bounds,
+                            &drawn_min_x,
+                            &drawn_min_y,
+                            &drawn_max_x,
+                            &drawn_max_y,
+                            left_x - 1,
+                            top_y - 1,
+                            right_x + 2,
+                            bottom_y + 2
+                        );
+                    }
+                } else {
+                    const int32_t start_x = fast_round_to_int32(
+                        origin_screen_x + (double)(start_point.position_x + params->world_offset_x) * scale
+                    );
+                    const int32_t start_y = fast_round_to_int32(
+                        origin_screen_y + (double)(start_point.position_y + params->world_offset_y) * scale
+                    );
+                    const int32_t end_x = fast_round_to_int32(
+                        origin_screen_x + (double)(end_point.position_x + params->world_offset_x) * scale
+                    );
+                    const int32_t end_y = fast_round_to_int32(
+                        origin_screen_y + (double)(end_point.position_y + params->world_offset_y) * scale
+                    );
+                    draw_blocks_non_diagonal_segment(
+                        canvas,
+                        params,
+                        chain.color_block_index,
+                        start_point,
+                        end_point,
+                        start_x,
+                        start_y,
+                        end_x,
+                        end_y,
+                        pitch,
+                        visual_flags,
+                        line_color,
+                        dimmed_color,
+                        draw_thick_outline
+                    );
+                    int32_t seg_min_x = start_x;
+                    int32_t seg_max_x = end_x;
+                    if (end_x < start_x) {
+                        seg_min_x = end_x;
+                        seg_max_x = start_x;
+                    }
+                    int32_t seg_min_y = start_y;
+                    int32_t seg_max_y = end_y;
+                    if (end_y < start_y) {
+                        seg_min_y = end_y;
+                        seg_max_y = start_y;
+                    }
+                    expand_screen_rect_bounds(
+                        &has_drawn_bounds,
+                        &drawn_min_x,
+                        &drawn_min_y,
+                        &drawn_max_x,
+                        &drawn_max_y,
+                        seg_min_x - 2,
+                        seg_min_y - 2,
+                        seg_max_x + 3,
+                        seg_max_y + 3
+                    );
+                }
+            }
+        }
+        if (has_drawn_bounds && bounds_min_x_out != nullptr && bounds_min_y_out != nullptr &&
+            bounds_max_x_out != nullptr && bounds_max_y_out != nullptr) {
+            *bounds_min_x_out = drawn_min_x;
+            *bounds_min_y_out = drawn_min_y;
+            *bounds_max_x_out = drawn_max_x;
+            *bounds_max_y_out = drawn_max_y;
+        }
+        return;
+    }
+
+    const bool thread_mode = (params->view_mode == VIEW_MODE_THREAD);
+    int32_t stroke_px = 1;
+    if (thread_mode) {
+        stroke_px = compute_thread_stroke_px(params->thread_thickness_index, scale);
+    }
+    const int32_t cull_margin = stroke_px + 2;
+
+    for (size_t subset_index = 0U; subset_index < chain_count; subset_index += 1U) {
+        const size_t chain_index = chain_indices[subset_index];
+        if (chain_index >= design->chain_count) {
+            continue;
+        }
+        const StitchChain chain = design->chains[chain_index];
+        if (chain.point_count < 2U || chain.color_block_index >= design->block_count ||
+            !design->blocks[chain.color_block_index].enabled) {
+            continue;
+        }
+        const RgbColor base_rgb = design->blocks[chain.color_block_index].display_color;
+        uint32_t core_color = pack_rgb_pixel(base_rgb.red, base_rgb.green, base_rgb.blue);
+        uint32_t outline_color = core_color;
+        uint32_t dimmed_core = make_dimmed_color(base_rgb);
+        uint32_t dimmed_outline = dimmed_core;
+        if (thread_mode) {
+            compute_thread_colors(base_rgb, false, &core_color, &outline_color);
+            compute_thread_colors(base_rgb, true, &dimmed_core, &dimmed_outline);
+        }
+
+        const StitchPoint *chain_points = &design->points[chain.point_offset];
+        int32_t start_x = fast_round_to_int32(
+            origin_screen_x + (double)(chain_points[0].position_x + params->world_offset_x) * scale
+        );
+        int32_t start_y = fast_round_to_int32(
+            origin_screen_y + (double)(chain_points[0].position_y + params->world_offset_y) * scale
+        );
+        const size_t chain_segments = chain.point_count - 1U;
+        for (size_t local_index = 0U; local_index < chain_segments; local_index += 1U) {
+            const StitchPoint next_point = chain_points[local_index + 1U];
+            const int32_t end_x = fast_round_to_int32(
+                origin_screen_x + (double)(next_point.position_x + params->world_offset_x) * scale
+            );
+            const int32_t end_y = fast_round_to_int32(
+                origin_screen_y + (double)(next_point.position_y + params->world_offset_y) * scale
+            );
+            const bool inside_viewport =
+                !((start_x < canvas->clip_min_x - cull_margin && end_x < canvas->clip_min_x - cull_margin) ||
+                  (start_x >= canvas->clip_max_x + cull_margin && end_x >= canvas->clip_max_x + cull_margin) ||
+                  (start_y < canvas->clip_min_y - cull_margin && end_y < canvas->clip_min_y - cull_margin) ||
+                  (start_y >= canvas->clip_max_y + cull_margin && end_y >= canvas->clip_max_y + cull_margin));
+            if (inside_viewport) {
+                draw_styled_segment_thread_or_line(
+                    canvas,
+                    start_x,
+                    start_y,
+                    end_x,
+                    end_y,
+                    thread_mode,
+                    stroke_px,
+                    visual_flags,
+                    core_color,
+                    outline_color,
+                    dimmed_core,
+                    dimmed_outline
+                );
+                int32_t seg_min_x = start_x;
+                int32_t seg_max_x = end_x;
+                if (end_x < start_x) {
+                    seg_min_x = end_x;
+                    seg_max_x = start_x;
+                }
+                int32_t seg_min_y = start_y;
+                int32_t seg_max_y = end_y;
+                if (end_y < start_y) {
+                    seg_min_y = end_y;
+                    seg_max_y = start_y;
+                }
+                expand_screen_rect_bounds(
+                    &has_drawn_bounds,
+                    &drawn_min_x,
+                    &drawn_min_y,
+                    &drawn_max_x,
+                    &drawn_max_y,
+                    seg_min_x - cull_margin,
+                    seg_min_y - cull_margin,
+                    seg_max_x + cull_margin + 1,
+                    seg_max_y + cull_margin + 1
+                );
+            }
+            start_x = end_x;
+            start_y = end_y;
+        }
+    }
+
+    if (has_drawn_bounds && bounds_min_x_out != nullptr && bounds_min_y_out != nullptr &&
+        bounds_max_x_out != nullptr && bounds_max_y_out != nullptr) {
+        *bounds_min_x_out = drawn_min_x;
+        *bounds_min_y_out = drawn_min_y;
+        *bounds_max_x_out = drawn_max_x;
+        *bounds_max_y_out = drawn_max_y;
+    }
 }

@@ -6,29 +6,241 @@
 #include "render.h"
 #include "ui.h"
 
-#include <SDL.h>
+#include <SDL3/SDL.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static void sync_sdl_text_input(bool *sdl_text_input_enabled, bool desired_active) {
-    if (*sdl_text_input_enabled == desired_active) {
+constexpr int32_t MAX_CANVAS_DIMENSION = 8192;
+
+typedef enum : uint8_t {
+    DIALOG_ACTION_NONE = 0U,
+    DIALOG_ACTION_OPEN = 1U,
+    DIALOG_ACTION_MERGE = 2U,
+    DIALOG_ACTION_SAVE_AS = 3U,
+    DIALOG_ACTION_STRIP_SAVE_AS = 4U
+} NativeDialogAction;
+
+typedef enum : uint8_t {
+    DISCARD_NONE = 0U,
+    DISCARD_QUIT = 1U,
+    DISCARD_OPEN = 2U
+} PendingDiscardKind;
+
+typedef struct {
+    NativeDialogAction action;
+    uint32_t user_event_type;
+} FileDialogRequest;
+
+typedef struct {
+    NativeDialogAction action;
+    bool failed;
+    bool cancelled;
+    char path[MAX_PATH_BUFFER];
+    char error_message[128];
+} FileDialogResult;
+
+typedef struct {
+    SDL_Window *window;
+    SDL_Renderer *renderer;
+    SDL_Texture *texture;
+    PixelCanvas canvas;
+    SDL_DialogFileFilter open_file_filters[OPEN_DIALOG_FILTER_COUNT];
+    SDL_DialogFileFilter save_file_filters[SAVE_DIALOG_FILTER_COUNT];
+    uint32_t dialog_event_type;
+    PendingDiscardKind pending_discard;
+    bool last_title_dirty;
+    char last_title_path[MAX_PATH_BUFFER];
+} AppHost;
+
+static void init_host_dialog_filters(AppHost *host) {
+    for (size_t filter_index = 0U; filter_index < OPEN_DIALOG_FILTER_COUNT; filter_index += 1U) {
+        host->open_file_filters[filter_index].name = open_dialog_filters[filter_index].name;
+        host->open_file_filters[filter_index].pattern = open_dialog_filters[filter_index].pattern;
+    }
+    for (size_t filter_index = 0U; filter_index < SAVE_DIALOG_FILTER_COUNT; filter_index += 1U) {
+        host->save_file_filters[filter_index].name = save_dialog_filters[filter_index].name;
+        host->save_file_filters[filter_index].pattern = save_dialog_filters[filter_index].pattern;
+    }
+}
+
+/* Background-safe SDL3 callback: copies chosen path and posts user event to main loop. */
+static void SDLCALL native_file_dialog_callback(
+    void *userdata,
+    const char *const *filelist,
+    int filter_index
+) {
+    (void)filter_index;
+    FileDialogRequest *request = (FileDialogRequest *)userdata;
+    if (request == nullptr) {
         return;
     }
-    if (desired_active) {
-        SDL_StartTextInput();
-    } else {
-        SDL_StopTextInput();
+
+    FileDialogResult *result = (FileDialogResult *)calloc(1U, sizeof(FileDialogResult));
+    if (result != nullptr) {
+        result->action = request->action;
+        if (filelist == nullptr) {
+            result->failed = true;
+            const char *sdl_error = SDL_GetError();
+            if (sdl_error != nullptr && sdl_error[0] != '\0') {
+                (void)snprintf(result->error_message, sizeof(result->error_message), "%.120s", sdl_error);
+            } else {
+                (void)snprintf(result->error_message, sizeof(result->error_message), "System dialog unavailable");
+            }
+        } else if (filelist[0] == nullptr || filelist[0][0] == '\0') {
+            result->cancelled = true;
+        } else {
+            (void)snprintf(result->path, sizeof(result->path), "%s", filelist[0]);
+        }
+
+        SDL_Event user_event = {};
+        user_event.type = request->user_event_type;
+        user_event.user.data1 = result;
+        if (!SDL_PushEvent(&user_event)) {
+            free(result);
+        }
     }
-    *sdl_text_input_enabled = desired_active;
+    free(request);
+}
+
+static void build_default_dialog_location(
+    const EditorState *state,
+    bool for_save,
+    const char *save_suffix,
+    char *output_path,
+    size_t output_capacity
+) {
+    output_path[0] = '\0';
+    if (for_save) {
+        const char *base_path = "untitled.jef";
+        if (state->has_file_path) {
+            base_path = state->current_file_path;
+        }
+        if (build_unique_suffixed_jef_path(base_path, save_suffix, output_path, output_capacity)) {
+            return;
+        }
+    }
+    if (state->has_file_path) {
+        const char *last_slash = strrchr(state->current_file_path, '/');
+        if (last_slash != nullptr) {
+            const size_t dir_len = (size_t)(last_slash - state->current_file_path) + 1U;
+            if (dir_len < output_capacity) {
+                memcpy(output_path, state->current_file_path, dir_len);
+                output_path[dir_len] = '\0';
+                return;
+            }
+        }
+    }
+    const char *home_dir = getenv("HOME");
+    if (home_dir != nullptr && home_dir[0] != '\0') {
+        (void)snprintf(output_path, output_capacity, "%s/", home_dir);
+    }
+}
+
+static void launch_native_file_dialog(AppHost *host, EditorState *state, NativeDialogAction action) {
+    if (host->dialog_event_type == 0U) {
+        set_status_message(state, "System file dialog unavailable; use Drag & Drop or CLI");
+        return;
+    }
+
+    FileDialogRequest *request = (FileDialogRequest *)calloc(1U, sizeof(FileDialogRequest));
+    if (request == nullptr) {
+        set_status_message(state, "Out of memory opening file dialog");
+        return;
+    }
+    request->action = action;
+    request->user_event_type = host->dialog_event_type;
+
+    char default_location[MAX_PATH_BUFFER] = {};
+    const char *location_arg = nullptr;
+    if (action == DIALOG_ACTION_OPEN || action == DIALOG_ACTION_MERGE) {
+        build_default_dialog_location(state, false, "", default_location, sizeof(default_location));
+        if (default_location[0] != '\0') {
+            location_arg = default_location;
+        }
+        SDL_ShowOpenFileDialog(
+            native_file_dialog_callback,
+            request,
+            host->window,
+            host->open_file_filters,
+            (int)OPEN_DIALOG_FILTER_COUNT,
+            location_arg,
+            false
+        );
+        set_status_message(state, "Waiting for system file dialog...");
+        return;
+    }
+
+    const char *suffix = "_edited";
+    if (action == DIALOG_ACTION_STRIP_SAVE_AS) {
+        suffix = "_strip";
+    }
+    build_default_dialog_location(state, true, suffix, default_location, sizeof(default_location));
+    if (default_location[0] != '\0') {
+        location_arg = default_location;
+    }
+    SDL_ShowSaveFileDialog(
+        native_file_dialog_callback,
+        request,
+        host->window,
+        host->save_file_filters,
+        (int)SAVE_DIALOG_FILTER_COUNT,
+        location_arg
+    );
+    set_status_message(state, "Waiting for system save dialog...");
+}
+
+static bool ensure_jef_extension(const char *input_path, char *output_path, size_t output_capacity) {
+    const size_t input_len = strlen(input_path);
+    const bool has_jef =
+        input_len >= 4U && strings_equal_ignore_case(input_path + (input_len - 4U), ".jef");
+    int written = 0;
+    if (has_jef) {
+        written = snprintf(output_path, output_capacity, "%s", input_path);
+    } else {
+        written = snprintf(output_path, output_capacity, "%s.jef", input_path);
+    }
+    return written > 0 && (size_t)written < output_capacity;
+}
+
+static void sync_window_title(AppHost *host, const EditorState *state) {
+    const char *current_path = "";
+    if (state->has_file_path) {
+        current_path = state->current_file_path;
+    }
+    if (host->last_title_dirty == state->is_dirty &&
+        strcmp(host->last_title_path, current_path) == 0) {
+        return;
+    }
+
+    char title[256] = {};
+    if (state->has_file_path) {
+        if (state->is_dirty) {
+            (void)snprintf(title, sizeof(title), "Embroidery Studio - *%.180s", basename_of_path(current_path));
+        } else {
+            (void)snprintf(title, sizeof(title), "Embroidery Studio - %.180s", basename_of_path(current_path));
+        }
+    } else if (state->is_dirty) {
+        (void)snprintf(title, sizeof(title), "Embroidery Studio - *untitled.jef");
+    } else {
+        (void)snprintf(title, sizeof(title), "Embroidery Studio");
+    }
+    (void)SDL_SetWindowTitle(host->window, title);
+    host->last_title_dirty = state->is_dirty;
+    (void)snprintf(host->last_title_path, sizeof(host->last_title_path), "%s", current_path);
+}
+
+static void clear_pending_discard(AppHost *host) {
+    host->pending_discard = DISCARD_NONE;
 }
 
 static bool load_design_into_editor(
+    AppHost *host,
     EditorState *state,
     const char *file_path,
-    int32_t window_width,
-    int32_t window_height
+    int32_t canvas_width,
+    int32_t canvas_height
 ) {
     StitchDesign loaded = {};
     if (!load_embroidery_file(file_path, &loaded)) {
@@ -36,6 +248,7 @@ static bool load_design_into_editor(
         return false;
     }
 
+    clear_pending_discard(host);
     clear_segment_selection(state);
     clear_hover_preview(state);
     clear_floating_fragment(state);
@@ -45,10 +258,13 @@ static bool load_design_into_editor(
 
     free_stitch_design(&state->design);
     state->design = loaded;
+    state->is_dirty = false;
+    editor_mark_design_changed(state, false);
     history_clear(&state->history);
     (void)history_push(&state->history, &state->design);
 
     state->grid = detect_cross_stitch_grid(&state->design);
+    editor_ensure_spatial_index(state);
     state->active_color_block_index = 0U;
     state->color_scroll_offset = 0;
     state->simulator_percent = 100.0;
@@ -64,8 +280,8 @@ static bool load_design_into_editor(
     state->hoop_rotated = false;
     state->hoop_preset_index = 5U;
     for (size_t preset_index = 1U; preset_index < HOOP_PRESET_COUNT; preset_index += 1U) {
-        const int32_t half_width = janome_550e_hoops[preset_index].width_units / 2;
-        const int32_t half_height = janome_550e_hoops[preset_index].height_units / 2;
+        const int32_t half_width = standard_hoop_presets[preset_index].width_units / 2;
+        const int32_t half_height = standard_hoop_presets[preset_index].height_units / 2;
         if (state->design.minimum_x >= -half_width && state->design.maximum_x <= half_width &&
             state->design.minimum_y >= -half_height && state->design.maximum_y <= half_height) {
             state->hoop_preset_index = preset_index;
@@ -73,7 +289,7 @@ static bool load_design_into_editor(
         }
     }
 
-    fit_camera_to_design(state, window_width, window_height);
+    fit_camera_to_design(state, canvas_width, canvas_height);
 
     char message[256] = {};
     const int message_written = snprintf(
@@ -93,8 +309,8 @@ static bool load_design_into_editor(
 static bool load_dropped_file_as_merge_fragment(
     EditorState *state,
     const char *file_path,
-    int32_t window_width,
-    int32_t window_height
+    int32_t canvas_width,
+    int32_t canvas_height
 ) {
     StitchDesign fragment = {};
     if (!load_embroidery_file(file_path, &fragment)) {
@@ -115,9 +331,9 @@ static bool load_dropped_file_as_merge_fragment(
     state->floating_anchor_y = 0;
 
     const int32_t cursor_world_x =
-        editor_screen_to_world_x(state, window_width, window_height, state->mouse_screen_x);
+        editor_screen_to_world_x(state, canvas_width, canvas_height, state->mouse_screen_x);
     const int32_t cursor_world_y =
-        editor_screen_to_world_y(state, window_width, window_height, state->mouse_screen_y);
+        editor_screen_to_world_y(state, canvas_width, canvas_height, state->mouse_screen_y);
     const int32_t pitch = state->grid.cross_pitch_units;
     const int32_t phase_shift_x = state->grid.grid_origin_x - state->floating_base_origin_x;
     const int32_t phase_shift_y = state->grid.grid_origin_y - state->floating_base_origin_y;
@@ -137,7 +353,7 @@ static bool load_dropped_file_as_merge_fragment(
     return true;
 }
 
-static void save_current_design(EditorState *state) {
+static void save_current_design(AppHost *host, EditorState *state) {
     const char *base_path = "untitled.jef";
     if (state->has_file_path) {
         base_path = state->current_file_path;
@@ -171,6 +387,8 @@ static void save_current_design(EditorState *state) {
         free_stitch_design(&part_one);
         free_stitch_design(&part_two);
         if (first_saved && second_saved) {
+            state->is_dirty = false;
+            clear_pending_discard(host);
             char message[256] = {};
             (void)snprintf(message, sizeof(message), "Saved %.60s & %.60s", basename_of_path(part_one_path), basename_of_path(part_two_path));
             set_status_message(state, message);
@@ -189,12 +407,99 @@ static void save_current_design(EditorState *state) {
         set_status_message(state, "Failed to save JEF (design may be empty)");
         return;
     }
+    state->is_dirty = false;
+    clear_pending_discard(host);
     char message[256] = {};
     (void)snprintf(message, sizeof(message), "Saved %.120s", basename_of_path(output_path));
     set_status_message(state, message);
 }
 
-static void delete_active_selection(EditorState *state) {
+static void handle_native_dialog_result(
+    AppHost *host,
+    EditorState *state,
+    FileDialogResult *result,
+    int32_t canvas_width,
+    int32_t canvas_height
+) {
+    if (result == nullptr) {
+        return;
+    }
+    if (result->failed) {
+        char message[256] = {};
+        (void)snprintf(
+            message,
+            sizeof(message),
+            "Dialog error (use Drag&Drop/CLI): %.120s",
+            result->error_message
+        );
+        set_status_message(state, message);
+        free(result);
+        return;
+    }
+    if (result->cancelled) {
+        set_status_message(state, "File dialog canceled");
+        free(result);
+        return;
+    }
+
+    if (result->action == DIALOG_ACTION_OPEN) {
+        (void)load_design_into_editor(host, state, result->path, canvas_width, canvas_height);
+    } else if (result->action == DIALOG_ACTION_MERGE) {
+        (void)load_dropped_file_as_merge_fragment(state, result->path, canvas_width, canvas_height);
+    } else if (result->action == DIALOG_ACTION_SAVE_AS) {
+        char final_path[MAX_PATH_BUFFER] = {};
+        if (!ensure_jef_extension(result->path, final_path, sizeof(final_path))) {
+            set_status_message(state, "Output path too long");
+        } else if (!write_jef_file(&state->design, final_path)) {
+            set_status_message(state, "Failed to write JEF file");
+        } else {
+            (void)snprintf(state->current_file_path, sizeof(state->current_file_path), "%s", final_path);
+            state->has_file_path = true;
+            state->is_dirty = false;
+            clear_pending_discard(host);
+            char message[256] = {};
+            (void)snprintf(message, sizeof(message), "Saved %.120s", basename_of_path(final_path));
+            set_status_message(state, message);
+        }
+    } else if (result->action == DIALOG_ACTION_STRIP_SAVE_AS) {
+        char final_path[MAX_PATH_BUFFER] = {};
+        StitchDesign strip_design = {};
+        if (!ensure_jef_extension(result->path, final_path, sizeof(final_path))) {
+            set_status_message(state, "Output path too long");
+        } else if (!build_strip_design(&state->strip_pattern, &strip_design) || strip_design.chain_count == 0U) {
+            set_status_message(state, "Strip is empty; paint crosses first");
+        } else if (!write_jef_file(&strip_design, final_path)) {
+            set_status_message(state, "Failed to save strip JEF");
+        } else {
+            char message[256] = {};
+            (void)snprintf(message, sizeof(message), "Saved strip %.120s", basename_of_path(final_path));
+            set_status_message(state, message);
+        }
+        free_stitch_design(&strip_design);
+    }
+    free(result);
+}
+
+static void request_open_with_dirty_guard(AppHost *host, EditorState *state) {
+    if (state->is_dirty && host->pending_discard != DISCARD_OPEN) {
+        host->pending_discard = DISCARD_OPEN;
+        set_status_message(state, "Unsaved changes! Press Ctrl+S to save, or click Open again");
+        return;
+    }
+    clear_pending_discard(host);
+    launch_native_file_dialog(host, state, DIALOG_ACTION_OPEN);
+}
+
+static void request_quit_with_dirty_guard(AppHost *host, EditorState *state) {
+    if (state->is_dirty && host->pending_discard != DISCARD_QUIT) {
+        host->pending_discard = DISCARD_QUIT;
+        set_status_message(state, "Unsaved changes! Press Ctrl+S to save, or quit again to discard");
+        return;
+    }
+    state->should_quit = true;
+}
+
+static void delete_active_selection(AppHost *host, EditorState *state) {
     if (state->selection_mask == nullptr || state->selected_segment_count == 0U) {
         set_status_message(state, "Nothing selected to delete");
         return;
@@ -212,6 +517,8 @@ static void delete_active_selection(EditorState *state) {
     }
     free_stitch_design(&state->design);
     state->design = result;
+    clear_pending_discard(host);
+    editor_mark_design_changed(state, true);
     (void)history_push(&state->history, &state->design);
     if (state->active_color_block_index >= state->design.block_count && state->design.block_count > 0U) {
         state->active_color_block_index = state->design.block_count - 1U;
@@ -221,7 +528,7 @@ static void delete_active_selection(EditorState *state) {
     set_status_message(state, "Deleted selection with tie-off locks");
 }
 
-static void commit_floating_fragment(EditorState *state, bool keep_stamping) {
+static void commit_floating_fragment(AppHost *host, EditorState *state, bool keep_stamping) {
     if (!state->has_floating_fragment) {
         return;
     }
@@ -238,6 +545,8 @@ static void commit_floating_fragment(EditorState *state, bool keep_stamping) {
     }
     free_stitch_design(&state->design);
     state->design = merged;
+    clear_pending_discard(host);
+    editor_mark_design_changed(state, true);
     (void)history_push(&state->history, &state->design);
     clear_hover_preview(state);
     if (!keep_stamping) {
@@ -261,10 +570,11 @@ static void open_strip_modal(EditorState *state) {
 }
 
 static void execute_toolbar_command(
+    AppHost *host,
     EditorState *state,
     uint8_t command_id,
-    int32_t window_width,
-    int32_t window_height
+    int32_t canvas_width,
+    int32_t canvas_height
 ) {
     switch (command_id) {
         case COMMAND_TOOL_SELECT_ELEMENT:
@@ -331,22 +641,33 @@ static void execute_toolbar_command(
             set_status_message(state, "Pick: click any stitch to select its color block");
             break;
         case COMMAND_OPEN_FILE_DIALOG:
-            open_file_dialog_state(state, FILE_DIALOG_OPEN);
+            request_open_with_dirty_guard(host, state);
             break;
         case COMMAND_MERGE_FILE_DIALOG:
-            open_file_dialog_state(state, FILE_DIALOG_MERGE);
+            launch_native_file_dialog(host, state, DIALOG_ACTION_MERGE);
             break;
         case COMMAND_SAVE_AS_DIALOG:
             if (state->design.chain_count == 0U) {
                 set_status_message(state, "Nothing to save");
             } else {
-                open_file_dialog_state(state, FILE_DIALOG_SAVE_AS);
+                launch_native_file_dialog(host, state, DIALOG_ACTION_SAVE_AS);
             }
+            break;
+        case COMMAND_TOGGLE_RIGHT_PANEL:
+            state->right_panel_collapsed = !state->right_panel_collapsed;
+            invalidate_stitch_layer_cache(&state->stitch_cache);
+            state->needs_redraw = true;
+            break;
+        case COMMAND_ADD_COLOR_BLOCK:
+            state->palette_target = PALETTE_TARGET_ADD_BLOCK;
+            state->needs_redraw = true;
             break;
         case COMMAND_ROTATE_90:
             if (state->design.chain_count > 0U) {
                 rotate_design_90_clockwise(&state->design);
                 state->grid = detect_cross_stitch_grid(&state->design);
+                clear_pending_discard(host);
+                editor_mark_design_changed(state, true);
                 (void)history_push(&state->history, &state->design);
                 clear_segment_selection(state);
                 clear_hover_preview(state);
@@ -357,6 +678,8 @@ static void execute_toolbar_command(
             if (state->design.chain_count > 0U) {
                 mirror_design_horizontal(&state->design);
                 state->grid = detect_cross_stitch_grid(&state->design);
+                clear_pending_discard(host);
+                editor_mark_design_changed(state, true);
                 (void)history_push(&state->history, &state->design);
                 clear_segment_selection(state);
                 clear_hover_preview(state);
@@ -367,6 +690,8 @@ static void execute_toolbar_command(
             if (state->design.chain_count > 0U) {
                 mirror_design_vertical(&state->design);
                 state->grid = detect_cross_stitch_grid(&state->design);
+                clear_pending_discard(host);
+                editor_mark_design_changed(state, true);
                 (void)history_push(&state->history, &state->design);
                 clear_segment_selection(state);
                 clear_hover_preview(state);
@@ -377,8 +702,10 @@ static void execute_toolbar_command(
             if (state->design.chain_count > 0U) {
                 center_stitch_design(&state->design);
                 state->grid = detect_cross_stitch_grid(&state->design);
+                clear_pending_discard(host);
+                editor_mark_design_changed(state, true);
                 (void)history_push(&state->history, &state->design);
-                fit_camera_to_design(state, window_width, window_height);
+                fit_camera_to_design(state, canvas_width, canvas_height);
                 set_status_message(state, "Centered design at (0, 0)");
             }
             break;
@@ -386,6 +713,8 @@ static void execute_toolbar_command(
             if (state->design.block_count > 1U) {
                 const size_t before_blocks = state->design.block_count;
                 if (merge_duplicate_color_blocks(&state->design)) {
+                    clear_pending_discard(host);
+                    editor_mark_design_changed(state, true);
                     (void)history_push(&state->history, &state->design);
                     if (state->active_color_block_index >= state->design.block_count &&
                         state->design.block_count > 0U) {
@@ -408,10 +737,12 @@ static void execute_toolbar_command(
             }
             break;
         case COMMAND_DELETE_SELECTION:
-            delete_active_selection(state);
+            delete_active_selection(host, state);
             break;
         case COMMAND_UNDO:
             if (history_undo(&state->history, &state->design)) {
+                clear_pending_discard(host);
+                editor_mark_design_changed(state, true);
                 clear_segment_selection(state);
                 clear_hover_preview(state);
                 clear_live_preview(state);
@@ -426,6 +757,8 @@ static void execute_toolbar_command(
             break;
         case COMMAND_REDO:
             if (history_redo(&state->history, &state->design)) {
+                clear_pending_discard(host);
+                editor_mark_design_changed(state, true);
                 clear_segment_selection(state);
                 clear_hover_preview(state);
                 clear_live_preview(state);
@@ -439,7 +772,7 @@ static void execute_toolbar_command(
             }
             break;
         case COMMAND_SAVE:
-            save_current_design(state);
+            save_current_design(host, state);
             break;
         case COMMAND_TOGGLE_DROP_MODE:
             state->drop_merge_mode = !state->drop_merge_mode;
@@ -451,11 +784,38 @@ static void execute_toolbar_command(
             break;
         case COMMAND_CYCLE_HOOP:
             state->hoop_preset_index = (state->hoop_preset_index + 1U) % HOOP_PRESET_COUNT;
-            state->needs_redraw = true;
+            if (state->hoop_preset_index == 0U) {
+                set_status_message(state, "Hoop overlay: Off");
+            } else {
+                char message[64] = {};
+                (void)snprintf(
+                    message,
+                    sizeof(message),
+                    "Hoop overlay: %s mm",
+                    standard_hoop_presets[state->hoop_preset_index].label
+                );
+                set_status_message(state, message);
+            }
             break;
         case COMMAND_ROTATE_HOOP:
             state->hoop_rotated = !state->hoop_rotated;
-            state->needs_redraw = true;
+            {
+                int32_t hoop_width = 0;
+                int32_t hoop_height = 0;
+                if (get_hoop_dimensions(state->hoop_preset_index, state->hoop_rotated, &hoop_width, &hoop_height)) {
+                    char message[64] = {};
+                    (void)snprintf(
+                        message,
+                        sizeof(message),
+                        "Hoop overlay: %dx%d mm",
+                        hoop_width / 10,
+                        hoop_height / 10
+                    );
+                    set_status_message(state, message);
+                } else {
+                    state->needs_redraw = true;
+                }
+            }
             break;
         case COMMAND_TOGGLE_GRID:
             state->show_grid = !state->show_grid;
@@ -517,208 +877,14 @@ static void execute_toolbar_command(
             }
             break;
         case COMMAND_FIT_VIEW:
-            fit_camera_to_design(state, window_width, window_height);
+            fit_camera_to_design(state, canvas_width, canvas_height);
             break;
         default:
             break;
     }
 }
 
-static void execute_file_dialog_confirm(
-    EditorState *state,
-    int32_t window_width,
-    int32_t window_height
-) {
-    FileDialogState *dialog = &state->file_dialog;
-    const bool is_save_mode =
-        dialog->mode == FILE_DIALOG_SAVE_AS ||
-        dialog->mode == FILE_DIALOG_STRIP_SAVE_AS;
-
-    if (!is_save_mode) {
-        if (dialog->selected_index >= dialog->entry_count) {
-            (void)snprintf(dialog->error_text, sizeof(dialog->error_text), "Select a file first");
-            state->needs_redraw = true;
-            return;
-        }
-        const FileBrowserEntry *entry = &dialog->entries[dialog->selected_index];
-        char full_path[MAX_PATH_BUFFER] = {};
-        int joined = 0;
-        if (strcmp(dialog->current_directory, "/") == 0) {
-            joined = snprintf(full_path, sizeof(full_path), "/%s", entry->name);
-        } else {
-            joined = snprintf(full_path, sizeof(full_path), "%s/%s", dialog->current_directory, entry->name);
-        }
-        if (joined <= 0 || (size_t)joined >= sizeof(full_path)) {
-            return;
-        }
-        if (entry->is_directory) {
-            (void)load_file_browser_directory(state, full_path);
-            return;
-        }
-        const FileDialogMode active_mode = dialog->mode;
-        close_file_dialog_state(state);
-        if (active_mode == FILE_DIALOG_OPEN) {
-            (void)load_design_into_editor(state, full_path, window_width, window_height);
-        } else if (active_mode == FILE_DIALOG_MERGE) {
-            (void)load_dropped_file_as_merge_fragment(state, full_path, window_width, window_height);
-        }
-        return;
-    }
-
-    if (dialog->filename_input[0] == '\0') {
-        (void)snprintf(dialog->error_text, sizeof(dialog->error_text), "Enter a filename");
-        state->needs_redraw = true;
-        return;
-    }
-
-    /* Auto-append .jef extension if missing. */
-    char clean_name[300] = {};
-    const size_t name_len = strlen(dialog->filename_input);
-    bool has_jef_suffix = false;
-    if (name_len >= 4U && strings_equal_ignore_case(dialog->filename_input + name_len - 4U, ".jef")) {
-        has_jef_suffix = true;
-    }
-    if (has_jef_suffix) {
-        (void)snprintf(clean_name, sizeof(clean_name), "%s", dialog->filename_input);
-    } else {
-        (void)snprintf(clean_name, sizeof(clean_name), "%s.jef", dialog->filename_input);
-    }
-
-    char target_path[MAX_PATH_BUFFER] = {};
-    int joined = 0;
-    if (strcmp(dialog->current_directory, "/") == 0) {
-        joined = snprintf(target_path, sizeof(target_path), "/%s", clean_name);
-    } else {
-        joined = snprintf(target_path, sizeof(target_path), "%s/%s", dialog->current_directory, clean_name);
-    }
-    if (joined <= 0 || (size_t)joined >= sizeof(target_path)) {
-        (void)snprintf(dialog->error_text, sizeof(dialog->error_text), "Path too long");
-        state->needs_redraw = true;
-        return;
-    }
-
-    if (file_already_exists(target_path)) {
-        if (!dialog->confirm_overwrite || strcmp(dialog->pending_overwrite_path, target_path) != 0) {
-            dialog->confirm_overwrite = true;
-            (void)snprintf(dialog->pending_overwrite_path, sizeof(dialog->pending_overwrite_path), "%s", target_path);
-            state->needs_redraw = true;
-            return;
-        }
-    }
-
-    bool saved = false;
-    if (dialog->mode == FILE_DIALOG_STRIP_SAVE_AS) {
-        StitchDesign built_strip = {};
-        if (!build_strip_design(&state->strip_pattern, &built_strip)) {
-            (void)snprintf(dialog->error_text, sizeof(dialog->error_text), "Strip is empty");
-            state->needs_redraw = true;
-            return;
-        }
-        saved = write_jef_file(&built_strip, target_path);
-        free_stitch_design(&built_strip);
-    } else {
-        saved = write_jef_file(&state->design, target_path);
-    }
-
-    if (!saved) {
-        (void)snprintf(dialog->error_text, sizeof(dialog->error_text), "Failed to write JEF file");
-        state->needs_redraw = true;
-        return;
-    }
-
-    char message[256] = {};
-    (void)snprintf(message, sizeof(message), "Saved %.120s", basename_of_path(target_path));
-    close_file_dialog_state(state);
-    set_status_message(state, message);
-}
-
-static void handle_file_dialog_command(
-    EditorState *state,
-    uint8_t command_id,
-    int32_t window_width,
-    int32_t window_height
-) {
-    if (command_id == DIALOG_CMD_CANCEL) {
-        close_file_dialog_state(state);
-        return;
-    }
-    if (command_id == DIALOG_CMD_CONFIRM) {
-        execute_file_dialog_confirm(state, window_width, window_height);
-        return;
-    }
-    if (command_id == DIALOG_CMD_PARENT) {
-        file_dialog_navigate_parent(state);
-        return;
-    }
-    if (command_id == DIALOG_CMD_HOME) {
-        file_dialog_navigate_home(state);
-        return;
-    }
-    if (command_id == DIALOG_CMD_DOWNLOADS) {
-        file_dialog_navigate_downloads(state);
-    }
-}
-
-static void handle_file_dialog_click(
-    EditorState *state,
-    int32_t mouse_x,
-    int32_t mouse_y,
-    int32_t window_width,
-    int32_t window_height,
-    uint32_t now_ticks
-) {
-    const FileDialogLayout layout = compute_file_dialog_layout(state, window_width, window_height);
-    const uint8_t button_command = hit_test_file_dialog_button(&layout, mouse_x, mouse_y);
-    if (button_command != DIALOG_CMD_NONE) {
-        handle_file_dialog_command(state, button_command, window_width, window_height);
-        return;
-    }
-
-    size_t clicked_index = SIZE_MAX;
-    if (!hit_test_file_dialog_entry(state, &layout, mouse_x, mouse_y, &clicked_index)) {
-        return;
-    }
-
-    FileDialogState *dialog = &state->file_dialog;
-    const bool is_double_click =
-        clicked_index == dialog->last_click_index &&
-        (now_ticks - dialog->last_click_ticks) <= DOUBLE_CLICK_MS;
-
-    dialog->selected_index = clicked_index;
-    dialog->last_click_index = clicked_index;
-    dialog->last_click_ticks = now_ticks;
-    dialog->confirm_overwrite = false;
-    dialog->error_text[0] = '\0';
-
-    const FileBrowserEntry *entry = &dialog->entries[clicked_index];
-    const bool is_save_mode =
-        dialog->mode == FILE_DIALOG_SAVE_AS ||
-        dialog->mode == FILE_DIALOG_STRIP_SAVE_AS;
-
-    if (!entry->is_directory && is_save_mode) {
-        (void)snprintf(dialog->filename_input, sizeof(dialog->filename_input), "%.255s", entry->name);
-    }
-    state->needs_redraw = true;
-
-    if (is_double_click) {
-        if (entry->is_directory) {
-            char next_dir[MAX_PATH_BUFFER] = {};
-            int joined = 0;
-            if (strcmp(dialog->current_directory, "/") == 0) {
-                joined = snprintf(next_dir, sizeof(next_dir), "/%s", entry->name);
-            } else {
-                joined = snprintf(next_dir, sizeof(next_dir), "%s/%s", dialog->current_directory, entry->name);
-            }
-            if (joined > 0 && (size_t)joined < sizeof(next_dir)) {
-                (void)load_file_browser_directory(state, next_dir);
-            }
-        } else {
-            execute_file_dialog_confirm(state, window_width, window_height);
-        }
-    }
-}
-
-static void apply_palette_selection(EditorState *state, uint8_t chosen_janome_index) {
+static void apply_palette_selection(AppHost *host, EditorState *state, uint8_t chosen_janome_index) {
     const PaletteModalTarget target = state->palette_target;
     state->palette_target = PALETTE_TARGET_NONE;
     if (chosen_janome_index >= JANOME_PALETTE_COUNT) {
@@ -740,9 +906,11 @@ static void apply_palette_selection(EditorState *state, uint8_t chosen_janome_in
         size_t new_block_index = 0U;
         if (design_append_block(&state->design, janome_palette[valid_janome], valid_janome, true, &new_block_index)) {
             state->active_color_block_index = new_block_index;
+            clear_pending_discard(host);
+            editor_mark_design_changed(state, true);
             (void)history_push(&state->history, &state->design);
             char message[128] = {};
-            (void)snprintf(message, sizeof(message), "Added Color Block #%zu (Janome #%02u)", new_block_index + 1U, (unsigned int)valid_janome);
+            (void)snprintf(message, sizeof(message), "Added Color Block #%zu (JEF #%02u)", new_block_index + 1U, (unsigned int)valid_janome);
             set_status_message(state, message);
         }
         return;
@@ -752,9 +920,11 @@ static void apply_palette_selection(EditorState *state, uint8_t chosen_janome_in
         state->palette_target_block_index < state->design.block_count) {
         state->design.blocks[state->palette_target_block_index].janome_color_index = valid_janome;
         state->design.blocks[state->palette_target_block_index].display_color = janome_palette[valid_janome];
+        clear_pending_discard(host);
+        editor_mark_design_changed(state, true);
         (void)history_push(&state->history, &state->design);
         char message[128] = {};
-        (void)snprintf(message, sizeof(message), "Changed Block #%zu to Janome #%02u", state->palette_target_block_index + 1U, (unsigned int)valid_janome);
+        (void)snprintf(message, sizeof(message), "Changed Block #%zu to JEF #%02u", state->palette_target_block_index + 1U, (unsigned int)valid_janome);
         set_status_message(state, message);
         return;
     }
@@ -766,31 +936,34 @@ static void apply_palette_selection(EditorState *state, uint8_t chosen_janome_in
         if (recolor_masked_segments(&state->design, state->selection_mask, state->selection_mask_length, valid_janome, &recolored)) {
             free_stitch_design(&state->design);
             state->design = recolored;
+            clear_pending_discard(host);
+            editor_mark_design_changed(state, true);
             (void)history_push(&state->history, &state->design);
             clear_segment_selection(state);
             clear_hover_preview(state);
             char message[128] = {};
-            (void)snprintf(message, sizeof(message), "Recolored selection to Janome #%02u", (unsigned int)valid_janome);
+            (void)snprintf(message, sizeof(message), "Recolored selection to JEF #%02u", (unsigned int)valid_janome);
             set_status_message(state, message);
         }
     }
 }
 
 static void handle_palette_modal_click(
+    AppHost *host,
     EditorState *state,
     int32_t mouse_x,
     int32_t mouse_y,
-    int32_t window_width,
-    int32_t window_height
+    int32_t canvas_width,
+    int32_t canvas_height
 ) {
-    int32_t chosen_index = -1;
-    if (!hit_test_palette_modal(mouse_x, mouse_y, window_width, window_height, &chosen_index)) {
+    int32_t palette_index = -1;
+    if (!hit_test_palette_modal(state, mouse_x, mouse_y, canvas_width, canvas_height, &palette_index)) {
         state->palette_target = PALETTE_TARGET_NONE;
         state->needs_redraw = true;
         return;
     }
-    if (chosen_index >= 0 && chosen_index < (int32_t)JANOME_PALETTE_COUNT) {
-        apply_palette_selection(state, (uint8_t)chosen_index);
+    if (palette_index >= 0) {
+        apply_palette_selection(host, state, (uint8_t)palette_index);
     }
 }
 
@@ -799,7 +972,7 @@ static void paint_strip_cell_at_mouse(
     const StripModalLayout *layout,
     int32_t mouse_x,
     int32_t mouse_y,
-    bool erase_mode
+    bool erase_cell
 ) {
     int32_t column = 0;
     int32_t row = 0;
@@ -807,31 +980,31 @@ static void paint_strip_cell_at_mouse(
         return;
     }
 
-    uint8_t target_color = state->strip_active_color;
-    if (target_color == 0U || target_color >= JANOME_PALETTE_COUNT) {
-        target_color = 10U;
+    uint8_t target_value = state->strip_active_color;
+    if (target_value == 0U || target_value >= JANOME_PALETTE_COUNT) {
+        target_value = 10U;
     }
-    if (erase_mode) {
-        target_color = 0U;
+    if (erase_cell) {
+        target_value = 0U;
     }
 
-    uint8_t *cell = &state->strip_pattern.cells[row * STRIP_MAX_GRID_DIM + column];
-    if (*cell == target_color) {
-        return;
+    const size_t cell_offset = (size_t)row * (size_t)STRIP_MAX_GRID_DIM + (size_t)column;
+    if (state->strip_pattern.cells[cell_offset] != target_value) {
+        if (!state->strip_stroke_pushed_undo) {
+            strip_history_push(state);
+            state->strip_stroke_pushed_undo = true;
+        }
+        state->strip_pattern.cells[cell_offset] = target_value;
+        state->needs_redraw = true;
     }
-    if (!state->strip_stroke_pushed_undo) {
-        strip_history_push(state);
-        state->strip_stroke_pushed_undo = true;
-    }
-    *cell = target_color;
-    state->needs_redraw = true;
 }
 
 static void handle_strip_command(
+    AppHost *host,
     EditorState *state,
     uint8_t command_id,
-    int32_t window_width,
-    int32_t window_height
+    int32_t canvas_width,
+    int32_t canvas_height
 ) {
     switch (command_id) {
         case STRIP_CMD_WIDTH_DEC:
@@ -864,28 +1037,24 @@ static void handle_strip_command(
             break;
         case STRIP_CMD_REPEAT_X_DEC:
             if (state->strip_pattern.repeat_x > 1) {
-                strip_history_push(state);
                 state->strip_pattern.repeat_x -= 1;
                 state->needs_redraw = true;
             }
             break;
         case STRIP_CMD_REPEAT_X_INC:
             if (state->strip_pattern.repeat_x < STRIP_MAX_REPEAT) {
-                strip_history_push(state);
                 state->strip_pattern.repeat_x += 1;
                 state->needs_redraw = true;
             }
             break;
         case STRIP_CMD_REPEAT_Y_DEC:
             if (state->strip_pattern.repeat_y > 1) {
-                strip_history_push(state);
                 state->strip_pattern.repeat_y -= 1;
                 state->needs_redraw = true;
             }
             break;
         case STRIP_CMD_REPEAT_Y_INC:
             if (state->strip_pattern.repeat_y < STRIP_MAX_REPEAT) {
-                strip_history_push(state);
                 state->strip_pattern.repeat_y += 1;
                 state->needs_redraw = true;
             }
@@ -922,11 +1091,12 @@ static void handle_strip_command(
             strip_history_push(state);
             for (int32_t row = 0; row < state->strip_pattern.height; row += 1) {
                 for (int32_t column = 0; column < state->strip_pattern.width / 2; column += 1) {
-                    const int32_t mirror_column = state->strip_pattern.width - 1 - column;
-                    const uint8_t saved = state->strip_pattern.cells[row * STRIP_MAX_GRID_DIM + column];
-                    state->strip_pattern.cells[row * STRIP_MAX_GRID_DIM + column] =
-                        state->strip_pattern.cells[row * STRIP_MAX_GRID_DIM + mirror_column];
-                    state->strip_pattern.cells[row * STRIP_MAX_GRID_DIM + mirror_column] = saved;
+                    const int32_t opposite = state->strip_pattern.width - 1 - column;
+                    const size_t left_offset = (size_t)row * (size_t)STRIP_MAX_GRID_DIM + (size_t)column;
+                    const size_t right_offset = (size_t)row * (size_t)STRIP_MAX_GRID_DIM + (size_t)opposite;
+                    const uint8_t swap_cell = state->strip_pattern.cells[left_offset];
+                    state->strip_pattern.cells[left_offset] = state->strip_pattern.cells[right_offset];
+                    state->strip_pattern.cells[right_offset] = swap_cell;
                 }
             }
             state->needs_redraw = true;
@@ -934,12 +1104,13 @@ static void handle_strip_command(
         case STRIP_CMD_MIRROR_Y:
             strip_history_push(state);
             for (int32_t row = 0; row < state->strip_pattern.height / 2; row += 1) {
-                const int32_t mirror_row = state->strip_pattern.height - 1 - row;
+                const int32_t opposite_row = state->strip_pattern.height - 1 - row;
                 for (int32_t column = 0; column < state->strip_pattern.width; column += 1) {
-                    const uint8_t saved = state->strip_pattern.cells[row * STRIP_MAX_GRID_DIM + column];
-                    state->strip_pattern.cells[row * STRIP_MAX_GRID_DIM + column] =
-                        state->strip_pattern.cells[mirror_row * STRIP_MAX_GRID_DIM + column];
-                    state->strip_pattern.cells[mirror_row * STRIP_MAX_GRID_DIM + column] = saved;
+                    const size_t top_offset = (size_t)row * (size_t)STRIP_MAX_GRID_DIM + (size_t)column;
+                    const size_t bottom_offset = (size_t)opposite_row * (size_t)STRIP_MAX_GRID_DIM + (size_t)column;
+                    const uint8_t swap_cell = state->strip_pattern.cells[top_offset];
+                    state->strip_pattern.cells[top_offset] = state->strip_pattern.cells[bottom_offset];
+                    state->strip_pattern.cells[bottom_offset] = swap_cell;
                 }
             }
             state->needs_redraw = true;
@@ -952,57 +1123,64 @@ static void handle_strip_command(
             }
             break;
         case STRIP_CMD_INSERT: {
-            StitchDesign built_strip = {};
-            if (!build_strip_design(&state->strip_pattern, &built_strip)) {
-                set_status_message(state, "Strip is empty: paint crosses first");
-                return;
+            StitchDesign generated = {};
+            if (!build_strip_design(&state->strip_pattern, &generated) || generated.chain_count == 0U) {
+                free_stitch_design(&generated);
+                set_status_message(state, "Strip is empty; paint at least one cross");
+                break;
             }
-            clear_floating_fragment(state);
-            clear_segment_selection(state);
-            state->floating_fragment = built_strip;
-            state->has_floating_fragment = true;
-            state->floating_is_grid_origin_aligned = true;
-            state->floating_base_origin_x = 0;
-            state->floating_base_origin_y = 0;
-            state->floating_anchor_x = 0;
-            state->floating_anchor_y = 0;
             state->strip_modal_open = false;
-
-            const int32_t cursor_world_x = editor_screen_to_world_x(state, window_width, window_height, state->mouse_screen_x);
-            const int32_t cursor_world_y = editor_screen_to_world_y(state, window_width, window_height, state->mouse_screen_y);
-            state->floating_offset_x = snap_coordinate_to_grid(cursor_world_x, state->grid.grid_origin_x, state->grid.cross_pitch_units);
-            state->floating_offset_y = snap_coordinate_to_grid(cursor_world_y, state->grid.grid_origin_y, state->grid.cross_pitch_units);
-            set_status_message(state, "Place Strip: move/arrows, Click/Enter insert, Esc cancel");
+            if (state->design.chain_count == 0U) {
+                free_stitch_design(&state->design);
+                state->design = generated;
+                state->grid = detect_cross_stitch_grid(&state->design);
+                state->grid.cross_pitch_units = state->strip_pattern.pitch_units;
+                state->grid.cross_passes = state->strip_pattern.passes;
+                clear_pending_discard(host);
+                editor_mark_design_changed(state, true);
+                history_clear(&state->history);
+                (void)history_push(&state->history, &state->design);
+                fit_camera_to_design(state, canvas_width, canvas_height);
+                set_status_message(state, "Created new cross-stitch strip design");
+            } else {
+                clear_floating_fragment(state);
+                state->floating_fragment = generated;
+                state->has_floating_fragment = true;
+                state->floating_is_grid_origin_aligned = false;
+                state->floating_anchor_x = (generated.minimum_x + generated.maximum_x) / 2;
+                state->floating_anchor_y = (generated.minimum_y + generated.maximum_y) / 2;
+                state->floating_offset_x = 0;
+                state->floating_offset_y = 0;
+                set_status_message(state, "Strip ready: move/arrows to dock, Click/Enter place, Shift+Click stamp");
+            }
+            break;
+        }
+        case STRIP_CMD_SAVE_JEF: {
+            StitchDesign generated = {};
+            if (!build_strip_design(&state->strip_pattern, &generated) || generated.chain_count == 0U) {
+                free_stitch_design(&generated);
+                set_status_message(state, "Strip is empty; paint crosses before saving");
+                break;
+            }
+            const char *base_path = "strip.jef";
+            if (state->has_file_path) {
+                base_path = state->current_file_path;
+            }
+            char output_path[MAX_PATH_BUFFER] = {};
+            if (build_unique_suffixed_jef_path(base_path, "_strip", output_path, sizeof(output_path)) &&
+                write_jef_file(&generated, output_path)) {
+                char message[256] = {};
+                (void)snprintf(message, sizeof(message), "Saved strip %.120s", basename_of_path(output_path));
+                set_status_message(state, message);
+            } else {
+                set_status_message(state, "Failed to save strip JEF");
+            }
+            free_stitch_design(&generated);
             break;
         }
         case STRIP_CMD_SAVE_AS:
-            open_file_dialog_state(state, FILE_DIALOG_STRIP_SAVE_AS);
+            launch_native_file_dialog(host, state, DIALOG_ACTION_STRIP_SAVE_AS);
             break;
-        case STRIP_CMD_SAVE_JEF: {
-            StitchDesign built_strip = {};
-            if (!build_strip_design(&state->strip_pattern, &built_strip)) {
-                set_status_message(state, "Strip is empty: paint crosses first");
-                return;
-            }
-            const char *base_path = "strip_design.jef";
-            const char *suffix = "_strip";
-            if (state->has_file_path) {
-                base_path = state->current_file_path;
-            } else {
-                suffix = "";
-            }
-            char output_path[MAX_PATH_BUFFER] = {};
-            if (build_unique_suffixed_jef_path(base_path, suffix, output_path, sizeof(output_path)) &&
-                write_jef_file(&built_strip, output_path)) {
-                char message[256] = {};
-                (void)snprintf(message, sizeof(message), "Exported strip to %.110s", basename_of_path(output_path));
-                set_status_message(state, message);
-            } else {
-                set_status_message(state, "Failed to export strip JEF");
-            }
-            free_stitch_design(&built_strip);
-            break;
-        }
         case STRIP_CMD_CLOSE:
             state->strip_modal_open = false;
             state->needs_redraw = true;
@@ -1012,42 +1190,79 @@ static void handle_strip_command(
     }
 }
 
-static bool handle_left_panel_click(
+static void toggle_solo_color_block(AppHost *host, EditorState *state, size_t block_index) {
+    if (block_index >= state->design.block_count) {
+        return;
+    }
+    bool any_other_enabled = false;
+    for (size_t index = 0U; index < state->design.block_count; index += 1U) {
+        if (index != block_index && state->design.blocks[index].enabled) {
+            any_other_enabled = true;
+            break;
+        }
+    }
+
+    if (any_other_enabled || !state->design.blocks[block_index].enabled) {
+        for (size_t index = 0U; index < state->design.block_count; index += 1U) {
+            state->design.blocks[index].enabled = (index == block_index);
+        }
+        char message[128] = {};
+        (void)snprintf(message, sizeof(message), "Solo Color Block #%zu (RMB again to restore all)", block_index + 1U);
+        set_status_message(state, message);
+    } else {
+        for (size_t index = 0U; index < state->design.block_count; index += 1U) {
+            state->design.blocks[index].enabled = true;
+        }
+        set_status_message(state, "Restored visibility of all color blocks");
+    }
+
+    recompute_design_bounds(&state->design);
+    clear_pending_discard(host);
+    editor_mark_design_changed(state, true);
+    (void)history_push(&state->history, &state->design);
+    state->preview_dirty = true;
+    clear_hover_preview(state);
+}
+
+static bool handle_color_list_click(
+    AppHost *host,
     EditorState *state,
+    const EditorLayout *layout,
+    uint8_t mouse_button,
     int32_t mouse_x,
-    int32_t mouse_y,
-    int32_t window_height
+    int32_t mouse_y
 ) {
     size_t block_index = SIZE_MAX;
-    const LeftPanelHitKind hit =
-        hit_test_left_panel(state, mouse_x, mouse_y, window_height, &block_index);
-    if (hit == LEFT_PANEL_HIT_NONE) {
+    const ColorListHitKind hit =
+        hit_test_color_list(state, layout, mouse_x, mouse_y, &block_index);
+    if (hit == COLOR_LIST_HIT_NONE) {
         return false;
     }
-    if (hit == LEFT_PANEL_HIT_PANEL_EMPTY) {
-        return true;
-    }
-    if (hit == LEFT_PANEL_HIT_ADD_COLOR) {
-        state->palette_target = PALETTE_TARGET_ADD_BLOCK;
-        state->needs_redraw = true;
-        return true;
-    }
-    if (block_index >= state->design.block_count) {
+    if (hit == COLOR_LIST_HIT_PANEL_EMPTY || block_index >= state->design.block_count) {
         return true;
     }
 
-    if (hit == LEFT_PANEL_HIT_TOGGLE_VISIBILITY) {
+    /* Right-click on V button or row toggles Solo visibility for that color block. */
+    if (mouse_button == SDL_BUTTON_RIGHT) {
+        toggle_solo_color_block(host, state, block_index);
+        return true;
+    }
+
+    if (hit == COLOR_LIST_HIT_TOGGLE_VISIBILITY) {
         state->design.blocks[block_index].enabled = !state->design.blocks[block_index].enabled;
         recompute_design_bounds(&state->design);
+        clear_pending_discard(host);
+        editor_mark_design_changed(state, true);
         (void)history_push(&state->history, &state->design);
         state->preview_dirty = true;
         clear_hover_preview(state);
-        state->needs_redraw = true;
         return true;
     }
-    if (hit == LEFT_PANEL_HIT_MOVE_UP) {
+    if (hit == COLOR_LIST_HIT_MOVE_UP) {
         if (move_color_block_order(&state->design, block_index, -1)) {
             state->active_color_block_index = block_index - 1U;
+            clear_pending_discard(host);
+            editor_mark_design_changed(state, true);
             (void)history_push(&state->history, &state->design);
             clear_segment_selection(state);
             clear_hover_preview(state);
@@ -1055,9 +1270,11 @@ static bool handle_left_panel_click(
         }
         return true;
     }
-    if (hit == LEFT_PANEL_HIT_MOVE_DOWN) {
+    if (hit == COLOR_LIST_HIT_MOVE_DOWN) {
         if (move_color_block_order(&state->design, block_index, 1)) {
             state->active_color_block_index = block_index + 1U;
+            clear_pending_discard(host);
+            editor_mark_design_changed(state, true);
             (void)history_push(&state->history, &state->design);
             clear_segment_selection(state);
             clear_hover_preview(state);
@@ -1065,17 +1282,19 @@ static bool handle_left_panel_click(
         }
         return true;
     }
-    if (hit == LEFT_PANEL_HIT_RECOLOR_BLOCK) {
+    if (hit == COLOR_LIST_HIT_RECOLOR_BLOCK) {
         state->palette_target = PALETTE_TARGET_RECOLOR_BLOCK;
         state->palette_target_block_index = block_index;
         state->needs_redraw = true;
         return true;
     }
-    if (hit == LEFT_PANEL_HIT_DELETE_BLOCK) {
+    if (hit == COLOR_LIST_HIT_DELETE_BLOCK) {
         if (remove_color_block_at(&state->design, block_index)) {
             if (state->active_color_block_index >= state->design.block_count && state->design.block_count > 0U) {
                 state->active_color_block_index = state->design.block_count - 1U;
             }
+            clear_pending_discard(host);
+            editor_mark_design_changed(state, true);
             (void)history_push(&state->history, &state->design);
             clear_segment_selection(state);
             clear_hover_preview(state);
@@ -1091,7 +1310,7 @@ static bool handle_left_panel_click(
     (void)snprintf(
         message,
         sizeof(message),
-        "Active Color: Block #%zu (Janome #%02u #%02X%02X%02X)",
+        "Active Color: Block #%zu (JEF #%02u #%02X%02X%02X | RMB=Solo)",
         block_index + 1U,
         (unsigned int)block.janome_color_index,
         (unsigned int)block.display_color.red,
@@ -1103,6 +1322,7 @@ static bool handle_left_panel_click(
 }
 
 static void apply_draw_x_stroke_at(
+    AppHost *host,
     EditorState *state,
     int32_t world_x,
     int32_t world_y,
@@ -1122,19 +1342,33 @@ static void apply_draw_x_stroke_at(
         if (total_segments == 0U) {
             return;
         }
-        uint8_t *erase_mask = (uint8_t *)calloc(total_segments, sizeof(uint8_t));
+        editor_ensure_spatial_index(state);
+        size_t mask_bytes = 0U;
+        if (!scratch_arena_add_slice_bytes(&mask_bytes, total_segments, sizeof(uint8_t)) ||
+            !scratch_arena_prepare(&state->scratch, mask_bytes)) {
+            return;
+        }
+        uint8_t *erase_mask = (uint8_t *)scratch_arena_push(&state->scratch, total_segments, sizeof(uint8_t));
         if (erase_mask == nullptr) {
             return;
         }
-        const size_t matched = select_cross_at_point_in_mask(
+        memset(erase_mask, 0, total_segments);
+        bool snapped = false;
+        const CutRectangle cross_box = resolve_cross_box_at_point_indexed(
             &state->design,
+            &state->spatial_index,
             state->grid,
             world_x,
             world_y,
+            &snapped
+        );
+        const size_t matched = select_cross_box_in_mask_indexed(
+            &state->design,
+            &state->spatial_index,
+            cross_box,
             erase_mask,
             total_segments,
-            false,
-            nullptr
+            false
         );
         if (matched > 0U) {
             StitchDesign trimmed = {};
@@ -1147,15 +1381,15 @@ static void apply_draw_x_stroke_at(
                 )) {
                 free_stitch_design(&state->design);
                 state->design = trimmed;
+                clear_pending_discard(host);
+                editor_mark_design_changed(state, true);
                 state->draw_stroke_pushed_undo = true;
                 state->last_drawn_column = cell_column;
                 state->last_drawn_row = cell_row;
                 clear_segment_selection(state);
                 clear_hover_preview(state);
-                state->needs_redraw = true;
             }
         }
-        free(erase_mask);
         return;
     }
 
@@ -1178,91 +1412,18 @@ static void apply_draw_x_stroke_at(
             cell_row,
             state->active_color_block_index
         )) {
+        clear_pending_discard(host);
+        editor_mark_design_changed(state, true);
         state->draw_stroke_pushed_undo = true;
         state->last_drawn_column = cell_column;
         state->last_drawn_row = cell_row;
         clear_segment_selection(state);
         clear_hover_preview(state);
-        state->needs_redraw = true;
-    }
-}
-
-static void update_canvas_hover(
-    EditorState *state,
-    int32_t mouse_x,
-    int32_t mouse_y,
-    int32_t window_width,
-    int32_t window_height
-) {
-    const RenderViewport viewport = get_editor_viewport(state, window_width, window_height);
-    if (!point_is_in_box(mouse_x, mouse_y, viewport.left, viewport.top, viewport.width, viewport.height) ||
-        state->design.chain_count == 0U ||
-        state->has_floating_fragment) {
-        if (state->hover_seed_chain != SIZE_MAX || state->has_hover_cross_box) {
-            clear_hover_preview(state);
-            state->needs_redraw = true;
-        }
-        return;
-    }
-
-    const int32_t world_x = viewport_screen_to_world_x(viewport, state->camera, mouse_x);
-    const int32_t world_y = viewport_screen_to_world_y(viewport, state->camera, mouse_y);
-
-    if (state->active_tool == TOOL_SELECT_CROSS) {
-        bool snapped = false;
-        const CutRectangle box = resolve_cross_box_at_point(&state->design, state->grid, world_x, world_y, &snapped);
-        if (!state->has_hover_cross_box ||
-            box.minimum_x != state->hover_cross_box.minimum_x ||
-            box.minimum_y != state->hover_cross_box.minimum_y) {
-            state->hover_cross_box = box;
-            state->has_hover_cross_box = true;
-            state->needs_redraw = true;
-        }
-        return;
-    }
-
-    if (state->active_tool == TOOL_SELECT_ELEMENT) {
-        int32_t search_radius = state->grid.cross_pitch_units;
-        const int32_t pixel_radius = (int32_t)llround(12.0 / state->camera.pixels_per_unit);
-        if (pixel_radius > search_radius) {
-            search_radius = pixel_radius;
-        }
-        size_t hovered_chain = SIZE_MAX;
-        if (!find_nearest_chain_at_point(&state->design, world_x, world_y, search_radius, &hovered_chain)) {
-            if (state->hover_seed_chain != SIZE_MAX) {
-                clear_hover_preview(state);
-                state->needs_redraw = true;
-            }
-            return;
-        }
-        if (hovered_chain == state->hover_seed_chain) {
-            return;
-        }
-
-        const size_t total_segments = count_design_segments(&state->design);
-        if (state->hover_mask == nullptr || state->hover_mask_length != total_segments) {
-            free(state->hover_mask);
-            state->hover_mask = (uint8_t *)calloc(total_segments, sizeof(uint8_t));
-            state->hover_mask_length = total_segments;
-        } else {
-            memset(state->hover_mask, 0, total_segments);
-        }
-        if (state->hover_mask != nullptr) {
-            (void)select_connected_element_in_mask(
-                &state->design,
-                state->grid,
-                hovered_chain,
-                state->hover_mask,
-                state->hover_mask_length,
-                false
-            );
-            state->hover_seed_chain = hovered_chain;
-            state->needs_redraw = true;
-        }
     }
 }
 
 static void nudge_active_selection_or_fragment(
+    AppHost *host,
     EditorState *state,
     int32_t step_columns,
     int32_t step_rows,
@@ -1298,6 +1459,8 @@ static void nudge_active_selection_or_fragment(
             )) {
             free_stitch_design(&state->design);
             state->design = shifted;
+            clear_pending_discard(host);
+            editor_mark_design_changed(state, true);
             (void)history_push(&state->history, &state->design);
             free(state->selection_mask);
             state->selection_mask = updated_mask;
@@ -1311,17 +1474,19 @@ static void nudge_active_selection_or_fragment(
 
     if (shift_held && state->design.chain_count > 0U) {
         shift_design_center(&state->design, delta_x, delta_y);
+        clear_pending_discard(host);
+        editor_mark_design_changed(state, true);
         (void)history_push(&state->history, &state->design);
         set_status_message(state, "Shifted design center");
     }
 }
 
-static void apply_box_edit_or_split(EditorState *state) {
+static void apply_box_edit_or_split(AppHost *host, EditorState *state) {
     if (!state->has_box_selection) {
         return;
     }
     if (state->active_tool == TOOL_SPLIT_VERTICAL || state->active_tool == TOOL_SPLIT_HORIZONTAL) {
-        save_current_design(state);
+        save_current_design(host, state);
         return;
     }
     if (state->active_tool != TOOL_CROP_KEEP && state->active_tool != TOOL_CUT_OUT) {
@@ -1344,6 +1509,8 @@ static void apply_box_edit_or_split(EditorState *state) {
     }
     free_stitch_design(&state->design);
     state->design = edited;
+    clear_pending_discard(host);
+    editor_mark_design_changed(state, true);
     clear_live_preview(state);
     state->has_box_selection = false;
     (void)history_push(&state->history, &state->design);
@@ -1354,6 +1521,7 @@ static void apply_box_edit_or_split(EditorState *state) {
 }
 
 static void handle_canvas_tool_mouse_down(
+    AppHost *host,
     EditorState *state,
     uint8_t mouse_button,
     int32_t world_x,
@@ -1365,14 +1533,22 @@ static void handle_canvas_tool_mouse_down(
             state->is_drawing_crosses = true;
             state->drawing_erases = (mouse_button == SDL_BUTTON_RIGHT);
             state->draw_stroke_pushed_undo = false;
-            apply_draw_x_stroke_at(state, world_x, world_y, state->drawing_erases);
+            apply_draw_x_stroke_at(host, state, world_x, world_y, state->drawing_erases);
         }
         return;
     }
 
     if (state->active_tool == TOOL_PICK_COLOR && mouse_button == SDL_BUTTON_LEFT) {
+        editor_ensure_spatial_index(state);
         size_t picked_chain = 0U;
-        if (find_nearest_chain_at_point(&state->design, world_x, world_y, state->grid.cross_pitch_units * 2, &picked_chain)) {
+        if (find_nearest_chain_at_point_indexed(
+                &state->design,
+                &state->spatial_index,
+                world_x,
+                world_y,
+                state->grid.cross_pitch_units * 2,
+                &picked_chain
+            )) {
             const size_t block_index = state->design.chains[picked_chain].color_block_index;
             if (block_index < state->design.block_count) {
                 state->active_color_block_index = block_index;
@@ -1381,7 +1557,7 @@ static void handle_canvas_tool_mouse_down(
                 (void)snprintf(
                     message,
                     sizeof(message),
-                    "Picked Block #%zu (Janome #%02u #%02X%02X%02X)",
+                    "Picked Block #%zu (JEF #%02u #%02X%02X%02X)",
                     block_index + 1U,
                     (unsigned int)block.janome_color_index,
                     (unsigned int)block.display_color.red,
@@ -1395,14 +1571,22 @@ static void handle_canvas_tool_mouse_down(
     }
 
     if (state->active_tool == TOOL_SELECT_ELEMENT) {
+        editor_ensure_spatial_index(state);
         if (mouse_button == SDL_BUTTON_RIGHT) {
             if (state->selected_segment_count > 0U) {
-                delete_active_selection(state);
+                delete_active_selection(host, state);
             } else if (state->hover_seed_chain != SIZE_MAX && ensure_selection_mask_allocated(state)) {
                 memset(state->selection_mask, 0, state->selection_mask_length);
-                (void)select_connected_element_in_mask(&state->design, state->grid, state->hover_seed_chain, state->selection_mask, state->selection_mask_length, false);
+                (void)select_connected_element_in_mask_indexed(
+                    &state->design,
+                    &state->spatial_index,
+                    state->hover_seed_chain,
+                    state->selection_mask,
+                    state->selection_mask_length,
+                    false
+                );
                 recount_selected_segments(state);
-                delete_active_selection(state);
+                delete_active_selection(host, state);
             }
             return;
         }
@@ -1413,7 +1597,14 @@ static void handle_canvas_tool_mouse_down(
             if (pixel_radius > search_radius) {
                 search_radius = pixel_radius;
             }
-            if (!find_nearest_chain_at_point(&state->design, world_x, world_y, search_radius, &picked_chain)) {
+            if (!find_nearest_chain_at_point_indexed(
+                    &state->design,
+                    &state->spatial_index,
+                    world_x,
+                    world_y,
+                    search_radius,
+                    &picked_chain
+                )) {
                 if (!shift_held) {
                     clear_segment_selection(state);
                     set_status_message(state, "Selection cleared");
@@ -1426,7 +1617,14 @@ static void handle_canvas_tool_mouse_down(
             if (!shift_held) {
                 memset(state->selection_mask, 0, state->selection_mask_length);
             }
-            (void)select_connected_element_in_mask(&state->design, state->grid, picked_chain, state->selection_mask, state->selection_mask_length, shift_held);
+            (void)select_connected_element_in_mask_indexed(
+                &state->design,
+                &state->spatial_index,
+                picked_chain,
+                state->selection_mask,
+                state->selection_mask_length,
+                shift_held
+            );
             recount_selected_segments(state);
             char message[128] = {};
             (void)snprintf(message, sizeof(message), "Sel Elem: %zu segments | Del, Recolor, Arrows", state->selected_segment_count);
@@ -1436,15 +1634,32 @@ static void handle_canvas_tool_mouse_down(
     }
 
     if (state->active_tool == TOOL_SELECT_CROSS) {
+        editor_ensure_spatial_index(state);
         if (mouse_button == SDL_BUTTON_RIGHT) {
             if (state->selected_segment_count > 0U) {
-                delete_active_selection(state);
+                delete_active_selection(host, state);
             } else if (ensure_selection_mask_allocated(state)) {
                 memset(state->selection_mask, 0, state->selection_mask_length);
-                (void)select_cross_at_point_in_mask(&state->design, state->grid, world_x, world_y, state->selection_mask, state->selection_mask_length, false, nullptr);
+                bool snapped = false;
+                const CutRectangle cross_box = resolve_cross_box_at_point_indexed(
+                    &state->design,
+                    &state->spatial_index,
+                    state->grid,
+                    world_x,
+                    world_y,
+                    &snapped
+                );
+                (void)select_cross_box_in_mask_indexed(
+                    &state->design,
+                    &state->spatial_index,
+                    cross_box,
+                    state->selection_mask,
+                    state->selection_mask_length,
+                    false
+                );
                 recount_selected_segments(state);
                 if (state->selected_segment_count > 0U) {
-                    delete_active_selection(state);
+                    delete_active_selection(host, state);
                 }
             }
             return;
@@ -1484,43 +1699,62 @@ static void handle_canvas_tool_mouse_down(
     }
 }
 
+static void convert_window_to_canvas_point(
+    const AppHost *host,
+    float window_x,
+    float window_y,
+    int32_t *canvas_x_out,
+    int32_t *canvas_y_out
+) {
+    float render_x = window_x;
+    float render_y = window_y;
+    if (host->renderer != nullptr) {
+        (void)SDL_RenderCoordinatesFromWindow(host->renderer, window_x, window_y, &render_x, &render_y);
+    }
+    *canvas_x_out = (int32_t)llround((double)render_x);
+    *canvas_y_out = (int32_t)llround((double)render_y);
+}
+
 static void handle_mouse_button_down(
+    AppHost *host,
     EditorState *state,
     const SDL_MouseButtonEvent *button_event,
-    int32_t window_width,
-    int32_t window_height
+    int32_t canvas_width,
+    int32_t canvas_height
 ) {
-    const int32_t mouse_x = button_event->x;
-    const int32_t mouse_y = button_event->y;
-    const SDL_Keymod key_mod = SDL_GetModState();
-    const bool shift_held = ((unsigned int)key_mod & (unsigned int)KMOD_SHIFT) != 0U;
+    int32_t mouse_x = 0;
+    int32_t mouse_y = 0;
+    convert_window_to_canvas_point(host, button_event->x, button_event->y, &mouse_x, &mouse_y);
+    state->mouse_screen_x = mouse_x;
+    state->mouse_screen_y = mouse_y;
+
+    const unsigned int key_mod = (unsigned int)SDL_GetModState();
+    const bool shift_held = (key_mod & (unsigned int)SDL_KMOD_SHIFT) != 0U;
 
     if (state->palette_target != PALETTE_TARGET_NONE) {
         if (button_event->button == SDL_BUTTON_LEFT) {
-            handle_palette_modal_click(state, mouse_x, mouse_y, window_width, window_height);
-        }
-        return;
-    }
-
-    if (state->file_dialog.mode != FILE_DIALOG_CLOSED) {
-        if (button_event->button == SDL_BUTTON_LEFT) {
-            handle_file_dialog_click(state, mouse_x, mouse_y, window_width, window_height, SDL_GetTicks());
+            handle_palette_modal_click(host, state, mouse_x, mouse_y, canvas_width, canvas_height);
+        } else if (button_event->button == SDL_BUTTON_RIGHT) {
+            state->palette_target = PALETTE_TARGET_NONE;
+            state->needs_redraw = true;
         }
         return;
     }
 
     if (state->strip_modal_open) {
-        const StripModalLayout layout = compute_strip_modal_layout(state, window_width, window_height);
+        const StripModalLayout layout = compute_strip_modal_layout(state, canvas_width, canvas_height);
         if (button_event->button == SDL_BUTTON_LEFT) {
-            const uint8_t strip_command = hit_test_strip_modal_button(&layout, mouse_x, mouse_y);
-            if (strip_command != STRIP_CMD_NONE) {
-                handle_strip_command(state, strip_command, window_width, window_height);
+            const uint8_t command_id = hit_test_strip_modal_button(&layout, mouse_x, mouse_y);
+            if (command_id != STRIP_CMD_NONE) {
+                handle_strip_command(host, state, command_id, canvas_width, canvas_height);
                 return;
             }
             state->strip_is_painting = true;
+            state->strip_is_erasing = false;
             state->strip_stroke_pushed_undo = false;
             paint_strip_cell_at_mouse(state, &layout, mouse_x, mouse_y, false);
         } else if (button_event->button == SDL_BUTTON_RIGHT) {
+            state->strip_is_painting = false;
             state->strip_is_erasing = true;
             state->strip_stroke_pushed_undo = false;
             paint_strip_cell_at_mouse(state, &layout, mouse_x, mouse_y, true);
@@ -1528,27 +1762,30 @@ static void handle_mouse_button_down(
         return;
     }
 
-    if (button_event->button == SDL_BUTTON_LEFT && mouse_y < state->toolbar_height) {
-        const uint8_t toolbar_command = hit_test_toolbar(state, mouse_x, mouse_y);
-        if (toolbar_command != COMMAND_NONE) {
-            execute_toolbar_command(state, toolbar_command, window_width, window_height);
+    const EditorLayout layout = compute_editor_layout(state, canvas_width, canvas_height);
+    if (button_event->button == SDL_BUTTON_LEFT) {
+        const uint8_t command_id = hit_test_editor_buttons(&layout, mouse_x, mouse_y);
+        if (command_id != COMMAND_NONE) {
+            execute_toolbar_command(host, state, command_id, canvas_width, canvas_height);
+            return;
         }
+        if (hit_test_slider_layout(&layout, mouse_x, mouse_y)) {
+            state->is_dragging_slider = true;
+            update_slider_from_layout(state, &layout, mouse_x);
+            return;
+        }
+    }
+
+    if (handle_color_list_click(host, state, &layout, button_event->button, mouse_x, mouse_y)) {
         return;
     }
 
-    if (button_event->button == SDL_BUTTON_LEFT && hit_test_slider(state, mouse_x, mouse_y)) {
-        state->is_dragging_slider = true;
-        update_slider_from_mouse(state, mouse_x);
+    if (!rect_contains_point(layout.viewport, mouse_x, mouse_y)) {
         return;
     }
 
-    if (button_event->button == SDL_BUTTON_LEFT &&
-        handle_left_panel_click(state, mouse_x, mouse_y, window_height)) {
-        return;
-    }
-
-    if (button_event->button == SDL_BUTTON_LEFT && should_show_start_screen(state)) {
-        const StartScreenLayout start_layout = compute_start_screen_layout(state, window_width, window_height);
+    if (should_show_start_screen(state) && button_event->button == SDL_BUTTON_LEFT) {
+        const StartScreenLayout start_layout = compute_start_screen_layout(state, canvas_width, canvas_height);
         if (point_is_in_box(
                 mouse_x,
                 mouse_y,
@@ -1557,7 +1794,7 @@ static void handle_mouse_button_down(
                 start_layout.open_button.width,
                 start_layout.open_button.height
             )) {
-            open_file_dialog_state(state, FILE_DIALOG_OPEN);
+            request_open_with_dirty_guard(host, state);
             return;
         }
         if (point_is_in_box(
@@ -1573,11 +1810,6 @@ static void handle_mouse_button_down(
         }
     }
 
-    const RenderViewport viewport = get_editor_viewport(state, window_width, window_height);
-    if (!point_is_in_box(mouse_x, mouse_y, viewport.left, viewport.top, viewport.width, viewport.height)) {
-        return;
-    }
-
     if (button_event->button == SDL_BUTTON_MIDDLE ||
         (button_event->button == SDL_BUTTON_LEFT && state->space_is_held)) {
         state->is_panning = true;
@@ -1588,27 +1820,38 @@ static void handle_mouse_button_down(
 
     if (state->has_floating_fragment) {
         if (button_event->button == SDL_BUTTON_LEFT) {
-            commit_floating_fragment(state, shift_held);
+            commit_floating_fragment(host, state, shift_held);
         } else if (button_event->button == SDL_BUTTON_RIGHT) {
             clear_floating_fragment(state);
-            set_status_message(state, "Cancelled fragment placement");
+            set_status_message(state, "Canceled floating fragment");
         }
         return;
     }
 
+    const RenderViewport viewport = {
+        .left = layout.viewport.x,
+        .top = layout.viewport.y,
+        .width = layout.viewport.width,
+        .height = layout.viewport.height
+    };
     const int32_t world_x = viewport_screen_to_world_x(viewport, state->camera, mouse_x);
     const int32_t world_y = viewport_screen_to_world_y(viewport, state->camera, mouse_y);
-    handle_canvas_tool_mouse_down(state, button_event->button, world_x, world_y, shift_held);
+    handle_canvas_tool_mouse_down(host, state, button_event->button, world_x, world_y, shift_held);
 }
 
 static void handle_mouse_button_up(
+    const AppHost *host,
     EditorState *state,
     const SDL_MouseButtonEvent *button_event,
-    int32_t window_width,
-    int32_t window_height
+    int32_t canvas_width,
+    int32_t canvas_height
 ) {
-    const SDL_Keymod key_mod = SDL_GetModState();
-    const bool shift_held = ((unsigned int)key_mod & (unsigned int)KMOD_SHIFT) != 0U;
+    int32_t mouse_x = 0;
+    int32_t mouse_y = 0;
+    convert_window_to_canvas_point(host, button_event->x, button_event->y, &mouse_x, &mouse_y);
+
+    const unsigned int key_mod = (unsigned int)SDL_GetModState();
+    const bool shift_held = (key_mod & (unsigned int)SDL_KMOD_SHIFT) != 0U;
 
     if (state->strip_modal_open) {
         state->strip_is_painting = false;
@@ -1637,8 +1880,8 @@ static void handle_mouse_button_up(
     }
     state->is_dragging_box = false;
 
-    const int32_t world_x = editor_screen_to_world_x(state, window_width, window_height, button_event->x);
-    const int32_t world_y = editor_screen_to_world_y(state, window_width, window_height, button_event->y);
+    const int32_t world_x = editor_screen_to_world_x(state, canvas_width, canvas_height, mouse_x);
+    const int32_t world_y = editor_screen_to_world_y(state, canvas_width, canvas_height, mouse_y);
 
     if (state->active_tool == TOOL_SELECT_CROSS) {
         state->has_box_selection = false;
@@ -1657,7 +1900,24 @@ static void handle_mouse_button_up(
             memset(state->selection_mask, 0, state->selection_mask_length);
         }
         if (drag_delta_x < 4 && drag_delta_y < 4) {
-            (void)select_cross_at_point_in_mask(&state->design, state->grid, world_x, world_y, state->selection_mask, state->selection_mask_length, shift_held, nullptr);
+            editor_ensure_spatial_index(state);
+            bool snapped = false;
+            const CutRectangle cross_box = resolve_cross_box_at_point_indexed(
+                &state->design,
+                &state->spatial_index,
+                state->grid,
+                world_x,
+                world_y,
+                &snapped
+            );
+            (void)select_cross_box_in_mask_indexed(
+                &state->design,
+                &state->spatial_index,
+                cross_box,
+                state->selection_mask,
+                state->selection_mask_length,
+                shift_held
+            );
         } else {
             const CutRectangle selection_box = {state->box_start_x, state->box_start_y, state->box_end_x, state->box_end_y};
             (void)select_crosses_in_rectangle_mask(&state->design, state->grid, selection_box, state->selection_mask, state->selection_mask_length);
@@ -1696,44 +1956,51 @@ static void handle_mouse_button_up(
 }
 
 static void handle_mouse_motion(
+    AppHost *host,
     EditorState *state,
     const SDL_MouseMotionEvent *motion_event,
-    int32_t window_width,
-    int32_t window_height
+    int32_t canvas_width,
+    int32_t canvas_height
 ) {
-    state->mouse_screen_x = motion_event->x;
-    state->mouse_screen_y = motion_event->y;
-    state->needs_redraw = true;
+    int32_t mouse_x = 0;
+    int32_t mouse_y = 0;
+    convert_window_to_canvas_point(host, motion_event->x, motion_event->y, &mouse_x, &mouse_y);
+    state->mouse_screen_x = mouse_x;
+    state->mouse_screen_y = mouse_y;
 
-    if (state->palette_target != PALETTE_TARGET_NONE || state->file_dialog.mode != FILE_DIALOG_CLOSED) {
+    if (state->palette_target != PALETTE_TARGET_NONE) {
+        state->needs_redraw = true;
         return;
     }
 
     if (state->strip_modal_open) {
+        state->needs_redraw = true;
         if (state->strip_is_painting || state->strip_is_erasing) {
-            const StripModalLayout layout = compute_strip_modal_layout(state, window_width, window_height);
-            paint_strip_cell_at_mouse(state, &layout, motion_event->x, motion_event->y, state->strip_is_erasing);
+            const StripModalLayout layout = compute_strip_modal_layout(state, canvas_width, canvas_height);
+            paint_strip_cell_at_mouse(state, &layout, mouse_x, mouse_y, state->strip_is_erasing);
         }
         return;
     }
 
     if (state->is_dragging_slider) {
-        update_slider_from_mouse(state, motion_event->x);
+        const EditorLayout layout = compute_editor_layout(state, canvas_width, canvas_height);
+        update_slider_from_layout(state, &layout, mouse_x);
         return;
     }
 
     if (state->is_panning) {
-        const double delta_x = (double)(motion_event->x - state->pan_last_x);
-        const double delta_y = (double)(motion_event->y - state->pan_last_y);
+        const double delta_x = (double)(mouse_x - state->pan_last_x);
+        const double delta_y = (double)(mouse_y - state->pan_last_y);
         state->camera.center_x -= delta_x / state->camera.pixels_per_unit;
         state->camera.center_y -= delta_y / state->camera.pixels_per_unit;
-        state->pan_last_x = motion_event->x;
-        state->pan_last_y = motion_event->y;
+        state->pan_last_x = mouse_x;
+        state->pan_last_y = mouse_y;
+        state->needs_redraw = true;
         return;
     }
 
-    const int32_t world_x = editor_screen_to_world_x(state, window_width, window_height, motion_event->x);
-    const int32_t world_y = editor_screen_to_world_y(state, window_width, window_height, motion_event->y);
+    const int32_t world_x = editor_screen_to_world_x(state, canvas_width, canvas_height, mouse_x);
+    const int32_t world_y = editor_screen_to_world_y(state, canvas_width, canvas_height, mouse_y);
 
     if (state->has_floating_fragment) {
         const int32_t pitch = state->grid.cross_pitch_units;
@@ -1746,16 +2013,17 @@ static void handle_mouse_motion(
             state->floating_offset_x = snap_coordinate_to_grid(world_x - state->floating_anchor_x, 0, pitch);
             state->floating_offset_y = snap_coordinate_to_grid(world_y - state->floating_anchor_y, 0, pitch);
         }
+        state->needs_redraw = true;
         return;
     }
 
     if (state->is_drawing_crosses) {
-        apply_draw_x_stroke_at(state, world_x, world_y, state->drawing_erases);
+        apply_draw_x_stroke_at(host, state, world_x, world_y, state->drawing_erases);
         return;
     }
 
     if (state->is_dragging_box) {
-        const bool shift_held = ((unsigned int)SDL_GetModState() & (unsigned int)KMOD_SHIFT) != 0U;
+        const bool shift_held = ((unsigned int)SDL_GetModState() & (unsigned int)SDL_KMOD_SHIFT) != 0U;
         if (state->active_tool == TOOL_SELECT_CROSS || !shift_held) {
             state->box_end_x = world_x;
             state->box_end_y = world_y;
@@ -1771,51 +2039,39 @@ static void handle_mouse_motion(
         if (tool_uses_box_preview(state->active_tool)) {
             state->preview_dirty = true;
         }
+        state->needs_redraw = true;
         return;
     }
 
-    update_canvas_hover(state, motion_event->x, motion_event->y, window_width, window_height);
+    const RenderViewport viewport = get_editor_viewport(state, canvas_width, canvas_height);
+    if (!point_is_in_box(mouse_x, mouse_y, viewport.left, viewport.top, viewport.width, viewport.height)) {
+        state->needs_redraw = true;
+    }
+    editor_update_canvas_hover(state, mouse_x, mouse_y, canvas_width, canvas_height);
 }
 
 static void handle_mouse_wheel(
     EditorState *state,
     const SDL_MouseWheelEvent *wheel_event,
-    int32_t window_width,
-    int32_t window_height
+    int32_t canvas_width,
+    int32_t canvas_height
 ) {
-    if (state->palette_target != PALETTE_TARGET_NONE) {
+    if (state->palette_target != PALETTE_TARGET_NONE || state->strip_modal_open) {
         return;
     }
 
-    if (state->file_dialog.mode != FILE_DIALOG_CLOSED) {
-        const FileDialogLayout layout = compute_file_dialog_layout(state, window_width, window_height);
-        state->file_dialog.scroll_offset -= wheel_event->y * FILE_ROW_HEIGHT * 2;
-        const int32_t content_height = (int32_t)state->file_dialog.entry_count * FILE_ROW_HEIGHT;
-        int32_t max_scroll = content_height - layout.list_height;
-        if (max_scroll < 0) {
-            max_scroll = 0;
-        }
-        if (state->file_dialog.scroll_offset < 0) {
-            state->file_dialog.scroll_offset = 0;
-        }
-        if (state->file_dialog.scroll_offset > max_scroll) {
-            state->file_dialog.scroll_offset = max_scroll;
-        }
-        state->needs_redraw = true;
+    const int32_t scroll_steps = (int32_t)llround((double)wheel_event->y);
+    if (scroll_steps == 0) {
         return;
     }
 
-    if (state->strip_modal_open) {
-        return;
-    }
-
-    if (state->mouse_screen_x < LEFT_PANEL_WIDTH &&
-        state->mouse_screen_y >= state->toolbar_height &&
-        state->mouse_screen_y < window_height - BOTTOM_PANEL_HEIGHT) {
-        state->color_scroll_offset -= wheel_event->y * COLOR_ROW_HEIGHT;
-        const int32_t list_height = window_height - state->toolbar_height - BOTTOM_PANEL_HEIGHT - 62;
-        const int32_t content_height = (int32_t)state->design.block_count * COLOR_ROW_HEIGHT;
-        int32_t maximum_scroll = content_height - list_height;
+    const EditorLayout layout = compute_editor_layout(state, canvas_width, canvas_height);
+    if (layout.right_panel.width > 0 &&
+        rect_contains_point(layout.right_panel, state->mouse_screen_x, state->mouse_screen_y)) {
+        const int32_t row_height = get_editor_color_row_height(state);
+        state->color_scroll_offset -= scroll_steps * row_height;
+        const int32_t content_height = (int32_t)state->design.block_count * row_height;
+        int32_t maximum_scroll = content_height - layout.colors_list_rect.height;
         if (maximum_scroll < 0) {
             maximum_scroll = 0;
         }
@@ -1829,12 +2085,12 @@ static void handle_mouse_wheel(
         return;
     }
 
-    const int32_t before_world_x = editor_screen_to_world_x(state, window_width, window_height, state->mouse_screen_x);
-    const int32_t before_world_y = editor_screen_to_world_y(state, window_width, window_height, state->mouse_screen_y);
+    const int32_t before_world_x = editor_screen_to_world_x(state, canvas_width, canvas_height, state->mouse_screen_x);
+    const int32_t before_world_y = editor_screen_to_world_y(state, canvas_width, canvas_height, state->mouse_screen_y);
 
-    if (wheel_event->y > 0) {
+    if (scroll_steps > 0) {
         state->camera.pixels_per_unit *= 1.18;
-    } else if (wheel_event->y < 0) {
+    } else {
         state->camera.pixels_per_unit /= 1.18;
     }
     if (state->camera.pixels_per_unit < 0.04) {
@@ -1844,27 +2100,24 @@ static void handle_mouse_wheel(
         state->camera.pixels_per_unit = 28.0;
     }
 
-    const int32_t after_world_x = editor_screen_to_world_x(state, window_width, window_height, state->mouse_screen_x);
-    const int32_t after_world_y = editor_screen_to_world_y(state, window_width, window_height, state->mouse_screen_y);
+    const int32_t after_world_x = editor_screen_to_world_x(state, canvas_width, canvas_height, state->mouse_screen_x);
+    const int32_t after_world_y = editor_screen_to_world_y(state, canvas_width, canvas_height, state->mouse_screen_y);
     state->camera.center_x += (double)(before_world_x - after_world_x);
     state->camera.center_y += (double)(before_world_y - after_world_y);
     state->needs_redraw = true;
 }
 
 static void handle_key_down(
+    AppHost *host,
     EditorState *state,
     const SDL_KeyboardEvent *key_event,
-    int32_t window_width,
-    int32_t window_height
+    int32_t canvas_width,
+    int32_t canvas_height
 ) {
-    const SDL_Keycode key_code = key_event->keysym.sym;
-    const bool ctrl_held = ((unsigned int)key_event->keysym.mod & (unsigned int)KMOD_CTRL) != 0U;
-    const bool shift_held = ((unsigned int)key_event->keysym.mod & (unsigned int)KMOD_SHIFT) != 0U;
-
-    if (key_code == SDLK_SPACE && state->file_dialog.mode == FILE_DIALOG_CLOSED) {
-        state->space_is_held = true;
-        return;
-    }
+    const SDL_Keycode key_code = key_event->key;
+    const unsigned int key_mod = (unsigned int)key_event->mod;
+    const bool ctrl_held = (key_mod & (unsigned int)SDL_KMOD_CTRL) != 0U;
+    const bool shift_held = (key_mod & (unsigned int)SDL_KMOD_SHIFT) != 0U;
 
     if (state->palette_target != PALETTE_TARGET_NONE) {
         if (key_code == SDLK_ESCAPE) {
@@ -1874,223 +2127,258 @@ static void handle_key_down(
         return;
     }
 
-    if (state->file_dialog.mode != FILE_DIALOG_CLOSED) {
+    if (state->strip_modal_open) {
         if (key_code == SDLK_ESCAPE) {
-            close_file_dialog_state(state);
-        } else if (key_code == SDLK_RETURN || key_code == SDLK_KP_ENTER) {
-            execute_file_dialog_confirm(state, window_width, window_height);
-        } else if (key_code == SDLK_BACKSPACE) {
-            file_dialog_backspace_input(state);
-        }
-        return;
-    }
-
-    if (key_code == SDLK_ESCAPE) {
-        if (state->strip_modal_open) {
             state->strip_modal_open = false;
             state->needs_redraw = true;
-            return;
-        }
-        if (state->has_floating_fragment) {
-            clear_floating_fragment(state);
-            set_status_message(state, "Cancelled placement");
-            return;
-        }
-        state->has_box_selection = false;
-        state->is_dragging_box = false;
-        clear_live_preview(state);
-        clear_segment_selection(state);
-        clear_hover_preview(state);
-        set_status_message(state, "Cleared selection");
-        return;
-    }
-
-    if (state->strip_modal_open) {
-        if (ctrl_held && key_code == SDLK_z) {
-            handle_strip_command(state, STRIP_CMD_UNDO, window_width, window_height);
+        } else if (ctrl_held && key_code == SDLK_Z) {
+            handle_strip_command(host, state, STRIP_CMD_UNDO, canvas_width, canvas_height);
+        } else if (key_code == SDLK_RETURN || key_code == SDLK_KP_ENTER) {
+            handle_strip_command(host, state, STRIP_CMD_INSERT, canvas_width, canvas_height);
         }
         return;
     }
 
-    if (ctrl_held && key_code == SDLK_q) {
-        state->should_quit = true;
+    if (key_code == SDLK_SPACE) {
+        state->space_is_held = true;
         return;
     }
-    if (ctrl_held && key_code == SDLK_o) {
-        open_file_dialog_state(state, FILE_DIALOG_OPEN);
+    if (key_code == SDLK_TAB) {
+        execute_toolbar_command(host, state, COMMAND_TOGGLE_RIGHT_PANEL, canvas_width, canvas_height);
         return;
     }
-    if (ctrl_held && key_code == SDLK_s) {
+    if (ctrl_held && key_code == SDLK_Z) {
         if (shift_held) {
-            execute_toolbar_command(state, COMMAND_SAVE_AS_DIALOG, window_width, window_height);
+            execute_toolbar_command(host, state, COMMAND_REDO, canvas_width, canvas_height);
         } else {
-            save_current_design(state);
+            execute_toolbar_command(host, state, COMMAND_UNDO, canvas_width, canvas_height);
         }
         return;
     }
-    if (ctrl_held && key_code == SDLK_z) {
+    if (ctrl_held && key_code == SDLK_Y) {
+        execute_toolbar_command(host, state, COMMAND_REDO, canvas_width, canvas_height);
+        return;
+    }
+    if (ctrl_held && key_code == SDLK_S) {
         if (shift_held) {
-            execute_toolbar_command(state, COMMAND_REDO, window_width, window_height);
+            execute_toolbar_command(host, state, COMMAND_SAVE_AS_DIALOG, canvas_width, canvas_height);
         } else {
-            execute_toolbar_command(state, COMMAND_UNDO, window_width, window_height);
+            execute_toolbar_command(host, state, COMMAND_SAVE, canvas_width, canvas_height);
         }
         return;
     }
-    if (ctrl_held && key_code == SDLK_y) {
-        execute_toolbar_command(state, COMMAND_REDO, window_width, window_height);
+    if (ctrl_held && key_code == SDLK_O) {
+        execute_toolbar_command(host, state, COMMAND_OPEN_FILE_DIALOG, canvas_width, canvas_height);
+        return;
+    }
+    if (ctrl_held && key_code == SDLK_M) {
+        execute_toolbar_command(host, state, COMMAND_MERGE_FILE_DIALOG, canvas_width, canvas_height);
+        return;
+    }
+    if (ctrl_held && key_code == SDLK_Q) {
+        request_quit_with_dirty_guard(host, state);
         return;
     }
 
     switch (key_code) {
         case SDLK_1:
-        case SDLK_e:
-            execute_toolbar_command(state, COMMAND_TOOL_SELECT_ELEMENT, window_width, window_height);
+            execute_toolbar_command(host, state, COMMAND_TOOL_SELECT_ELEMENT, canvas_width, canvas_height);
             break;
         case SDLK_2:
-        case SDLK_x:
-            execute_toolbar_command(state, COMMAND_TOOL_SELECT_CROSS, window_width, window_height);
+            execute_toolbar_command(host, state, COMMAND_TOOL_SELECT_CROSS, canvas_width, canvas_height);
             break;
         case SDLK_3:
-        case SDLK_d:
-            execute_toolbar_command(state, COMMAND_TOOL_DRAW_CROSS, window_width, window_height);
-            break;
-        case SDLK_m:
-            execute_toolbar_command(state, COMMAND_OPEN_STRIP_MODAL, window_width, window_height);
+            execute_toolbar_command(host, state, COMMAND_TOOL_DRAW_CROSS, canvas_width, canvas_height);
             break;
         case SDLK_4:
-            execute_toolbar_command(state, COMMAND_TOOL_CROP, window_width, window_height);
+            execute_toolbar_command(host, state, COMMAND_TOOL_CROP, canvas_width, canvas_height);
             break;
         case SDLK_5:
-            execute_toolbar_command(state, COMMAND_TOOL_CUT, window_width, window_height);
+            execute_toolbar_command(host, state, COMMAND_TOOL_CUT, canvas_width, canvas_height);
             break;
         case SDLK_6:
-            execute_toolbar_command(state, COMMAND_TOOL_SPLIT_V, window_width, window_height);
+            execute_toolbar_command(host, state, COMMAND_TOOL_SPLIT_V, canvas_width, canvas_height);
             break;
         case SDLK_7:
-            execute_toolbar_command(state, COMMAND_TOOL_SPLIT_H, window_width, window_height);
+            execute_toolbar_command(host, state, COMMAND_TOOL_SPLIT_H, canvas_width, canvas_height);
             break;
         case SDLK_8:
-            execute_toolbar_command(state, COMMAND_TOOL_CLONE, window_width, window_height);
+            execute_toolbar_command(host, state, COMMAND_TOOL_CLONE, canvas_width, canvas_height);
             break;
         case SDLK_9:
-        case SDLK_i:
-            execute_toolbar_command(state, COMMAND_TOOL_PICK, window_width, window_height);
+            execute_toolbar_command(host, state, COMMAND_TOOL_PICK, canvas_width, canvas_height);
             break;
-        case SDLK_r:
-            execute_toolbar_command(state, COMMAND_ROTATE_90, window_width, window_height);
+        case SDLK_T:
+            execute_toolbar_command(host, state, COMMAND_CYCLE_VIEW_MODE, canvas_width, canvas_height);
             break;
-        case SDLK_h:
-            execute_toolbar_command(state, COMMAND_FLIP_X, window_width, window_height);
+        case SDLK_K:
+            execute_toolbar_command(host, state, COMMAND_CYCLE_THREAD_THICKNESS, canvas_width, canvas_height);
             break;
-        case SDLK_v:
-            execute_toolbar_command(state, COMMAND_FLIP_Y, window_width, window_height);
+        case SDLK_G:
+            execute_toolbar_command(host, state, COMMAND_TOGGLE_GRID, canvas_width, canvas_height);
             break;
-        case SDLK_c:
-            execute_toolbar_command(state, COMMAND_CENTER, window_width, window_height);
+        case SDLK_J:
+            execute_toolbar_command(host, state, COMMAND_TOGGLE_JUMPS, canvas_width, canvas_height);
             break;
-        case SDLK_g:
-            execute_toolbar_command(state, COMMAND_TOGGLE_GRID, window_width, window_height);
+        case SDLK_L:
+            execute_toolbar_command(host, state, COMMAND_TOGGLE_LOCKS, canvas_width, canvas_height);
             break;
-        case SDLK_j:
-            execute_toolbar_command(state, COMMAND_TOGGLE_JUMPS, window_width, window_height);
+        case SDLK_F:
+            execute_toolbar_command(host, state, COMMAND_FIT_VIEW, canvas_width, canvas_height);
             break;
-        case SDLK_l:
-            execute_toolbar_command(state, COMMAND_TOGGLE_LOCKS, window_width, window_height);
+        case SDLK_R:
+            execute_toolbar_command(host, state, COMMAND_ROTATE_90, canvas_width, canvas_height);
             break;
-        case SDLK_o:
-            execute_toolbar_command(state, COMMAND_CYCLE_HOOP, window_width, window_height);
+        case SDLK_H:
+            execute_toolbar_command(host, state, COMMAND_FLIP_X, canvas_width, canvas_height);
             break;
-        case SDLK_t:
-            execute_toolbar_command(state, COMMAND_CYCLE_VIEW_MODE, window_width, window_height);
+        case SDLK_V:
+            execute_toolbar_command(host, state, COMMAND_FLIP_Y, canvas_width, canvas_height);
             break;
-        case SDLK_w:
-            execute_toolbar_command(state, COMMAND_CYCLE_THREAD_THICKNESS, window_width, window_height);
+        case SDLK_C:
+            execute_toolbar_command(host, state, COMMAND_CENTER, canvas_width, canvas_height);
             break;
-        case SDLK_f:
-        case SDLK_0:
-            execute_toolbar_command(state, COMMAND_FIT_VIEW, window_width, window_height);
+        case SDLK_P:
+            execute_toolbar_command(host, state, COMMAND_CYCLE_PASSES, canvas_width, canvas_height);
+            break;
+        case SDLK_LEFTBRACKET:
+            execute_toolbar_command(host, state, COMMAND_PITCH_DECREASE, canvas_width, canvas_height);
+            break;
+        case SDLK_RIGHTBRACKET:
+            execute_toolbar_command(host, state, COMMAND_PITCH_INCREASE, canvas_width, canvas_height);
             break;
         case SDLK_DELETE:
         case SDLK_BACKSPACE:
-            delete_active_selection(state);
+            delete_active_selection(host, state);
             break;
         case SDLK_RETURN:
         case SDLK_KP_ENTER:
             if (state->has_floating_fragment) {
-                commit_floating_fragment(state, shift_held);
+                commit_floating_fragment(host, state, shift_held);
             } else {
-                apply_box_edit_or_split(state);
+                apply_box_edit_or_split(host, state);
+            }
+            break;
+        case SDLK_ESCAPE:
+            clear_pending_discard(host);
+            if (state->has_floating_fragment) {
+                clear_floating_fragment(state);
+                set_status_message(state, "Canceled floating fragment");
+            } else if (state->has_box_selection) {
+                state->has_box_selection = false;
+                state->is_dragging_box = false;
+                clear_live_preview(state);
+                set_status_message(state, "Cleared box selection");
+            } else if (state->selected_segment_count > 0U) {
+                clear_segment_selection(state);
+                set_status_message(state, "Cleared selection");
             }
             break;
         case SDLK_LEFT:
-            nudge_active_selection_or_fragment(state, -1, 0, shift_held);
+            nudge_active_selection_or_fragment(host, state, -1, 0, shift_held);
             break;
         case SDLK_RIGHT:
-            nudge_active_selection_or_fragment(state, 1, 0, shift_held);
+            nudge_active_selection_or_fragment(host, state, 1, 0, shift_held);
             break;
         case SDLK_UP:
-            nudge_active_selection_or_fragment(state, 0, -1, shift_held);
+            nudge_active_selection_or_fragment(host, state, 0, -1, shift_held);
             break;
         case SDLK_DOWN:
-            nudge_active_selection_or_fragment(state, 0, 1, shift_held);
+            nudge_active_selection_or_fragment(host, state, 0, 1, shift_held);
             break;
         default:
             break;
     }
 }
 
-static bool resize_pixel_canvas(
-    PixelCanvas *canvas,
-    SDL_Renderer *renderer,
-    SDL_Texture **texture_slot,
-    int32_t new_width,
-    int32_t new_height
-) {
-    if (new_width < 64) {
-        new_width = 64;
+static bool resize_host_surface(AppHost *host, int32_t new_width, int32_t new_height) {
+    if (new_width < 320) {
+        new_width = 320;
     }
-    if (new_height < 64) {
-        new_height = 64;
+    if (new_height < 240) {
+        new_height = 240;
     }
-    if (canvas->width == new_width && canvas->height == new_height &&
-        canvas->pixels != nullptr && *texture_slot != nullptr) {
+    if (new_width > MAX_CANVAS_DIMENSION) {
+        new_width = MAX_CANVAS_DIMENSION;
+    }
+    if (new_height > MAX_CANVAS_DIMENSION) {
+        new_height = MAX_CANVAS_DIMENSION;
+    }
+    if (host->canvas.pixels != nullptr &&
+        host->canvas.width == new_width &&
+        host->canvas.height == new_height &&
+        host->texture != nullptr) {
         return true;
     }
 
-    size_t pixel_count = 0U;
-    size_t pixel_bytes = 0U;
-    if (ckd_mul(&pixel_count, (size_t)new_width, (size_t)new_height) ||
-        ckd_mul(&pixel_bytes, pixel_count, sizeof(uint32_t))) {
-        return false;
-    }
-
-    uint32_t *next_pixels = (uint32_t *)malloc(pixel_bytes);
-    if (next_pixels == nullptr) {
+    PixelCanvas next_canvas = {};
+    if (!init_pixel_canvas(&next_canvas, new_width, new_height)) {
         return false;
     }
     SDL_Texture *next_texture = SDL_CreateTexture(
-        renderer,
-        SDL_PIXELFORMAT_ARGB8888,
+        host->renderer,
+        SDL_PIXELFORMAT_XRGB8888,
         SDL_TEXTUREACCESS_STREAMING,
         new_width,
         new_height
     );
     if (next_texture == nullptr) {
-        free(next_pixels);
+        free_pixel_canvas(&next_canvas);
         return false;
     }
 
-    if (*texture_slot != nullptr) {
-        SDL_DestroyTexture(*texture_slot);
+    if (host->texture != nullptr) {
+        SDL_DestroyTexture(host->texture);
     }
-    free(canvas->pixels);
-
-    *texture_slot = next_texture;
-    canvas->pixels = next_pixels;
-    canvas->width = new_width;
-    canvas->height = new_height;
-    reset_canvas_clip(canvas);
+    free_pixel_canvas(&host->canvas);
+    host->canvas = next_canvas;
+    host->texture = next_texture;
     return true;
+}
+
+static void present_frame_to_gpu(AppHost *host, const EditorState *state) {
+    if (host->renderer == nullptr || host->texture == nullptr || host->canvas.pixels == nullptr) {
+        return;
+    }
+    const int32_t pitch_bytes = host->canvas.width * (int32_t)sizeof(uint32_t);
+    const StitchLayerCache *cache = &state->stitch_cache;
+    if (cache->has_dirty_rect &&
+        cache->dirty_min_x >= 0 &&
+        cache->dirty_min_y >= 0 &&
+        cache->dirty_max_x <= host->canvas.width &&
+        cache->dirty_max_y <= host->canvas.height &&
+        cache->dirty_max_x > cache->dirty_min_x &&
+        cache->dirty_max_y > cache->dirty_min_y) {
+        const SDL_Rect dirty_rect = {
+            .x = cache->dirty_min_x,
+            .y = cache->dirty_min_y,
+            .w = cache->dirty_max_x - cache->dirty_min_x,
+            .h = cache->dirty_max_y - cache->dirty_min_y
+        };
+        const uint32_t *sub_pixels =
+            host->canvas.pixels +
+            (size_t)dirty_rect.y * (size_t)host->canvas.width +
+            (size_t)dirty_rect.x;
+        (void)SDL_UpdateTexture(host->texture, &dirty_rect, sub_pixels, pitch_bytes);
+    } else {
+        (void)SDL_UpdateTexture(host->texture, nullptr, host->canvas.pixels, pitch_bytes);
+    }
+    (void)SDL_RenderTexture(host->renderer, host->texture, nullptr, nullptr);
+    (void)SDL_RenderPresent(host->renderer);
+}
+
+static void sync_host_ui_scale(const AppHost *host, EditorState *state) {
+    if (host->window == nullptr) {
+        return;
+    }
+    float display_scale = SDL_GetWindowDisplayScale(host->window);
+    if (display_scale <= 0.0f) {
+        display_scale = SDL_GetWindowPixelDensity(host->window);
+    }
+    if (display_scale <= 0.0f) {
+        display_scale = 1.0f;
+    }
+    editor_set_ui_scale(state, (double)display_scale);
 }
 
 static void print_usage(FILE *stream) {
@@ -2099,155 +2387,170 @@ static void print_usage(FILE *stream) {
 
 int main(int argument_count, char **argument_values) {
     int exit_code = EXIT_FAILURE;
-    SDL_Window *window = nullptr;
-    SDL_Renderer *renderer = nullptr;
-    SDL_Texture *framebuffer_texture = nullptr;
     bool sdl_initialized = false;
-    bool sdl_text_input_enabled = false;
-    PixelCanvas canvas = {};
+    AppHost host = {};
     EditorState state = {};
 
+    if (argument_count > 1 &&
+        (strcmp(argument_values[1], "-h") == 0 || strcmp(argument_values[1], "--help") == 0)) {
+        print_usage(stdout);
+        return EXIT_SUCCESS;
+    }
+
+    init_host_dialog_filters(&host);
     init_default_editor_state(&state);
 
-    const char *initial_input_path = nullptr;
-    if (argument_count == 2) {
-        if (strcmp(argument_values[1], "-h") == 0 || strcmp(argument_values[1], "--help") == 0) {
-            print_usage(stdout);
-            exit_code = EXIT_SUCCESS;
-            goto cleanup;
-        }
-        if (argument_values[1][0] == '-') {
-            (void)fprintf(stderr, "Unknown option: %s\n", argument_values[1]);
-            print_usage(stderr);
-            goto cleanup;
-        }
-        initial_input_path = argument_values[1];
-    } else if (argument_count > 2) {
-        (void)fprintf(stderr, "Too many arguments\n");
-        print_usage(stderr);
-        goto cleanup;
-    }
-
-    if (getenv("SDL_VIDEODRIVER") == nullptr) {
-        (void)SDL_SetHint(SDL_HINT_VIDEODRIVER, "wayland,x11");
-    }
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+    /* Prefer native Wayland on Linux with seamless fallback to X11. */
+    (void)SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "wayland,x11");
+    if (!SDL_Init(SDL_INIT_VIDEO)) {
         (void)fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         goto cleanup;
     }
     sdl_initialized = true;
-    (void)SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
 
-    const int centered_position = (int)SDL_WINDOWPOS_CENTERED_MASK;
-    const uint32_t window_flags = (uint32_t)SDL_WINDOW_RESIZABLE | (uint32_t)SDL_WINDOW_SHOWN;
-    window = SDL_CreateWindow(
-        "embroidery-studio (Janome MC550E)",
-        centered_position,
-        centered_position,
+    host.dialog_event_type = SDL_RegisterEvents(1);
+
+    const SDL_WindowFlags window_flags =
+        (SDL_WindowFlags)((uint64_t)SDL_WINDOW_RESIZABLE | (uint64_t)SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    host.window = SDL_CreateWindow(
+        "Embroidery Studio",
         WINDOW_INITIAL_WIDTH,
         WINDOW_INITIAL_HEIGHT,
         window_flags
     );
-    if (window == nullptr) {
+    if (host.window == nullptr) {
         (void)fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         goto cleanup;
     }
 
-    const uint32_t renderer_flags =
-        (uint32_t)SDL_RENDERER_ACCELERATED | (uint32_t)SDL_RENDERER_PRESENTVSYNC;
-    renderer = SDL_CreateRenderer(window, -1, renderer_flags);
-    if (renderer == nullptr) {
-        renderer = SDL_CreateRenderer(window, -1, (uint32_t)SDL_RENDERER_SOFTWARE);
-    }
-    if (renderer == nullptr) {
+    host.renderer = SDL_CreateRenderer(host.window, nullptr);
+    if (host.renderer == nullptr) {
         (void)fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
         goto cleanup;
     }
+    (void)SDL_SetRenderVSync(host.renderer, 1);
 
-    int window_width = WINDOW_INITIAL_WIDTH;
-    int window_height = WINDOW_INITIAL_HEIGHT;
-    SDL_GetWindowSize(window, &window_width, &window_height);
-    if (!resize_pixel_canvas(&canvas, renderer, &framebuffer_texture, window_width, window_height)) {
-        (void)fprintf(stderr, "Failed to allocate initial framebuffer\n");
+    int initial_pixel_width = WINDOW_INITIAL_WIDTH;
+    int initial_pixel_height = WINDOW_INITIAL_HEIGHT;
+    (void)SDL_GetWindowSizeInPixels(host.window, &initial_pixel_width, &initial_pixel_height);
+    sync_host_ui_scale(&host, &state);
+    if (!resize_host_surface(&host, (int32_t)initial_pixel_width, (int32_t)initial_pixel_height)) {
+        (void)fprintf(stderr, "Failed to create initial SDL3 pixel canvas\n");
         goto cleanup;
     }
-    layout_toolbar_buttons(&state, canvas.width);
 
-    if (initial_input_path != nullptr) {
-        if (!load_design_into_editor(&state, initial_input_path, canvas.width, canvas.height)) {
-            goto cleanup;
-        }
+    if (argument_count > 1 && argument_values[1][0] != '\0') {
+        (void)load_design_into_editor(
+            &host,
+            &state,
+            argument_values[1],
+            host.canvas.width,
+            host.canvas.height
+        );
     }
 
     while (!state.should_quit) {
         SDL_Event event = {};
-        if (SDL_WaitEventTimeout(&event, 16) != 0) {
+        if (SDL_WaitEventTimeout(&event, 16)) {
             do {
-                if (event.type == SDL_QUIT) {
-                    state.should_quit = true;
-                } else if (event.type == SDL_WINDOWEVENT &&
-                           (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
-                            event.window.event == SDL_WINDOWEVENT_EXPOSED)) {
-                    SDL_GetWindowSize(window, &window_width, &window_height);
-                    if (!resize_pixel_canvas(&canvas, renderer, &framebuffer_texture, window_width, window_height)) {
-                        state.should_quit = true;
+                if (host.dialog_event_type != 0U && event.type == host.dialog_event_type) {
+                    handle_native_dialog_result(
+                        &host,
+                        &state,
+                        (FileDialogResult *)event.user.data1,
+                        host.canvas.width,
+                        host.canvas.height
+                    );
+                    continue;
+                }
+                switch (event.type) {
+                    case SDL_EVENT_QUIT:
+                        request_quit_with_dirty_guard(&host, &state);
+                        break;
+                    case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
+                    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+                    case SDL_EVENT_WINDOW_RESIZED: {
+                        int pixel_width = host.canvas.width;
+                        int pixel_height = host.canvas.height;
+                        (void)SDL_GetWindowSizeInPixels(host.window, &pixel_width, &pixel_height);
+                        sync_host_ui_scale(&host, &state);
+                        if (resize_host_surface(&host, (int32_t)pixel_width, (int32_t)pixel_height)) {
+                            invalidate_stitch_layer_cache(&state.stitch_cache);
+                            state.needs_redraw = true;
+                        }
                         break;
                     }
-                    state.needs_redraw = true;
-                } else if (event.type == SDL_DROPFILE && event.drop.file != nullptr) {
-                    if (state.file_dialog.mode != FILE_DIALOG_CLOSED) {
-                        close_file_dialog_state(&state);
-                    }
-                    if (state.design.chain_count == 0U || !state.drop_merge_mode) {
-                        (void)load_design_into_editor(&state, event.drop.file, canvas.width, canvas.height);
-                    } else {
-                        (void)load_dropped_file_as_merge_fragment(&state, event.drop.file, canvas.width, canvas.height);
-                    }
-                    SDL_free(event.drop.file);
-                } else if (event.type == SDL_TEXTINPUT) {
-                    file_dialog_append_text_input(&state, event.text.text);
-                } else if (event.type == SDL_MOUSEBUTTONDOWN) {
-                    handle_mouse_button_down(&state, &event.button, canvas.width, canvas.height);
-                } else if (event.type == SDL_MOUSEBUTTONUP) {
-                    handle_mouse_button_up(&state, &event.button, canvas.width, canvas.height);
-                } else if (event.type == SDL_MOUSEMOTION) {
-                    handle_mouse_motion(&state, &event.motion, canvas.width, canvas.height);
-                } else if (event.type == SDL_MOUSEWHEEL) {
-                    handle_mouse_wheel(&state, &event.wheel, canvas.width, canvas.height);
-                } else if (event.type == SDL_KEYDOWN) {
-                    handle_key_down(&state, &event.key, canvas.width, canvas.height);
-                } else if (event.type == SDL_KEYUP && event.key.keysym.sym == SDLK_SPACE) {
-                    state.space_is_held = false;
+                    case SDL_EVENT_WINDOW_EXPOSED:
+                        invalidate_stitch_layer_cache(&state.stitch_cache);
+                        state.needs_redraw = true;
+                        break;
+                    case SDL_EVENT_DROP_FILE:
+                        if (event.drop.data != nullptr && event.drop.data[0] != '\0') {
+                            if (state.drop_merge_mode && state.design.chain_count > 0U) {
+                                (void)load_dropped_file_as_merge_fragment(
+                                    &state,
+                                    event.drop.data,
+                                    host.canvas.width,
+                                    host.canvas.height
+                                );
+                            } else {
+                                (void)load_design_into_editor(
+                                    &host,
+                                    &state,
+                                    event.drop.data,
+                                    host.canvas.width,
+                                    host.canvas.height
+                                );
+                            }
+                        }
+                        break;
+                    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+                        handle_mouse_button_down(&host, &state, &event.button, host.canvas.width, host.canvas.height);
+                        break;
+                    case SDL_EVENT_MOUSE_BUTTON_UP:
+                        handle_mouse_button_up(&host, &state, &event.button, host.canvas.width, host.canvas.height);
+                        break;
+                    case SDL_EVENT_MOUSE_MOTION:
+                        handle_mouse_motion(&host, &state, &event.motion, host.canvas.width, host.canvas.height);
+                        break;
+                    case SDL_EVENT_MOUSE_WHEEL:
+                        handle_mouse_wheel(&state, &event.wheel, host.canvas.width, host.canvas.height);
+                        break;
+                    case SDL_EVENT_KEY_DOWN:
+                        handle_key_down(&host, &state, &event.key, host.canvas.width, host.canvas.height);
+                        break;
+                    case SDL_EVENT_KEY_UP:
+                        if (event.key.key == SDLK_SPACE) {
+                            state.space_is_held = false;
+                        }
+                        break;
+                    default:
+                        break;
                 }
-            } while (SDL_PollEvent(&event) != 0);
+            } while (!state.should_quit && SDL_PollEvent(&event));
         }
 
-        sync_sdl_text_input(&sdl_text_input_enabled, state.text_input_active);
-
         if (state.needs_redraw) {
-            render_editor_frame(&canvas, &state);
-            (void)SDL_UpdateTexture(framebuffer_texture, nullptr, canvas.pixels, canvas.width * (int)sizeof(uint32_t));
-            (void)SDL_RenderClear(renderer);
-            (void)SDL_RenderCopy(renderer, framebuffer_texture, nullptr, nullptr);
-            SDL_RenderPresent(renderer);
             state.needs_redraw = false;
+            sync_window_title(&host, &state);
+            render_editor_frame(&host.canvas, &state);
+            present_frame_to_gpu(&host, &state);
         }
     }
 
     exit_code = EXIT_SUCCESS;
 
 cleanup:
-    sync_sdl_text_input(&sdl_text_input_enabled, false);
     free_editor_state(&state);
-    free_pixel_canvas(&canvas);
-    if (framebuffer_texture != nullptr) {
-        SDL_DestroyTexture(framebuffer_texture);
+    free_pixel_canvas(&host.canvas);
+    if (host.texture != nullptr) {
+        SDL_DestroyTexture(host.texture);
     }
-    if (renderer != nullptr) {
-        SDL_DestroyRenderer(renderer);
+    if (host.renderer != nullptr) {
+        SDL_DestroyRenderer(host.renderer);
     }
-    if (window != nullptr) {
-        SDL_DestroyWindow(window);
+    if (host.window != nullptr) {
+        SDL_DestroyWindow(host.window);
     }
     if (sdl_initialized) {
         SDL_Quit();
