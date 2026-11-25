@@ -1,0 +1,16 @@
+Checks: >-
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  cert-err33-c,
+  cert-int*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-branch-clone,
+  -bugprone-multi-level-implicit-pointer-conversion,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+WarningsAsErrors: '*'
+HeaderFilterRegex: '^src/.*\.h$'
+CheckOptions:
+  - key: bugprone-reserved-identifier.AllowedIdentifiers
+    value: '^_POSIX_C_SOURCE$'

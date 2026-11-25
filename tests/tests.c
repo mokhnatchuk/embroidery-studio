@@ -1,12 +1,18 @@
 #define _POSIX_C_SOURCE 200809L
 
-#include "core.h"
+#include "formats.h"
+#include "model.h"
+#include "ops.h"
+#include "render.h"
+#include "ui.h"
 
 #include <dirent.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 static bool assert_condition(bool condition, const char *message) {
     if (!condition) {
@@ -716,7 +722,7 @@ static bool test_core_editing_workflows(void) {
         goto cleanup;
     }
     if (!assert_condition(
-            delete_masked_segments(&original, segment_mask, total_segments, &edited),
+            delete_masked_segments(&original, grid.cross_pitch_units, segment_mask, total_segments, &edited),
             "Sel X delete masked cell"
         )) {
         goto cleanup;
@@ -807,7 +813,7 @@ static bool test_core_editing_workflows(void) {
     free_stitch_design(&combined);
 
     if (!assert_condition(
-            delete_masked_segments(&original, segment_mask, total_segments, &edited),
+            delete_masked_segments(&original, grid.cross_pitch_units, segment_mask, total_segments, &edited),
             "Sel Elem delete element"
         )) {
         goto cleanup;
@@ -1119,6 +1125,439 @@ static bool test_optional_real_directory(void) {
     return all_ok;
 }
 
+static bool test_stage1_security_and_correctness_regressions(void) {
+    bool passed = false;
+    const char *unsorted_jef_path = "/tmp/embroidery_studio_test_unsorted.jef";
+    char temp_probe_path[256] = {};
+    StitchDesign unsorted = {};
+    StitchDesign reloaded = {};
+    StitchDesign corrupt_blocks = {};
+    StitchDesign duplicate_blocks = {};
+    StitchDesign pitch28_source = {};
+    StitchDesign pitch28_deleted = {};
+    StitchDesign zero_chain_design = {};
+    StitchDesign history_work = {};
+    StitchDesign dir_test = {};
+    EditHistory history = {};
+
+    /* 1. write_jef_file with unsorted/interleaved color blocks + atomic overwrite. */
+    size_t red_block = 0U;
+    size_t blue_block = 0U;
+    if (!assert_condition(
+            design_append_block(&unsorted, janome_palette[10], 10U, true, &red_block) &&
+            design_append_block(&unsorted, janome_palette[12], 12U, true, &blue_block),
+            "create 2 color blocks for interleaved JEF export"
+        )) {
+        goto cleanup;
+    }
+
+    const size_t chain_blocks[3] = {red_block, blue_block, red_block};
+    for (size_t chain_slot = 0U; chain_slot < 3U; chain_slot += 1U) {
+        const size_t offset = unsorted.point_count;
+        const int32_t base_x = (int32_t)chain_slot * 36;
+        if (!design_append_point(&unsorted, base_x, 0) ||
+            !design_append_point(&unsorted, base_x + 18, 18) ||
+            !design_append_point(&unsorted, base_x + 18, 0) ||
+            !design_append_point(&unsorted, base_x, 18) ||
+            !design_append_chain(&unsorted, offset, 4U, chain_blocks[chain_slot], false, false)) {
+            goto cleanup;
+        }
+    }
+    recompute_design_bounds(&unsorted);
+
+    if (!assert_condition(
+            write_jef_file(&unsorted, unsorted_jef_path) &&
+            write_jef_file(&unsorted, unsorted_jef_path),
+            "write_jef_file handles interleaved chains and atomic overwrite safely"
+        )) {
+        goto cleanup;
+    }
+    (void)snprintf(temp_probe_path, sizeof(temp_probe_path), "%s.tmp.%ld", unsorted_jef_path, (long)getpid());
+    if (!assert_condition(!file_already_exists(temp_probe_path), "atomic save leaves no temporary file behind")) {
+        goto cleanup;
+    }
+    if (!assert_condition(load_embroidery_file(unsorted_jef_path, &reloaded), "reload interleaved JEF")) {
+        goto cleanup;
+    }
+    const DesignStats reloaded_stats = compute_design_stats(&reloaded);
+    if (!assert_condition(
+            reloaded_stats.color_count == 2U && reloaded_stats.stitch_count >= 9U,
+            "interleaved JEF grouped into 2 color blocks with stitches intact"
+        )) {
+        goto cleanup;
+    }
+
+    /* 2. build_edit_segment_mask with short mask_length < total_segments (must terminate). */
+    const CrossGridInfo default_grid = {
+        .cross_pitch_units = 18,
+        .grid_origin_x = 0,
+        .grid_origin_y = 0,
+        .cross_passes = 3,
+        .raw_detected_passes = 3,
+        .diagonal_stitch_count = 0U,
+        .detected_from_design = true
+    };
+    const CutRectangle cut_box = {-10, -10, 20, 20};
+    uint8_t tiny_mask[3] = {};
+    if (!assert_condition(
+            build_edit_segment_mask(&unsorted, default_grid, EDIT_CUT_OUT, cut_box, 0, false, tiny_mask, sizeof(tiny_mask)) &&
+            build_edit_segment_mask(&unsorted, default_grid, EDIT_CUT_OUT, cut_box, 0, false, tiny_mask, 1U) &&
+            build_edit_segment_mask(&unsorted, default_grid, EDIT_CUT_OUT, cut_box, 0, false, nullptr, 0U),
+            "build_edit_segment_mask terminates cleanly on short or empty mask"
+        )) {
+        goto cleanup;
+    }
+
+    /* 3. compact_non_empty_blocks & merge_duplicate_color_blocks OOB index guards + point compaction. */
+    if (!assert_condition(clone_stitch_design(&unsorted, &corrupt_blocks), "clone design for OOB block guard")) {
+        goto cleanup;
+    }
+    const size_t points_before_compact = corrupt_blocks.point_count;
+    corrupt_blocks.chains[2].color_block_index = 999U;
+    if (!assert_condition(
+            compact_non_empty_blocks(&corrupt_blocks) &&
+            corrupt_blocks.chain_count == 2U &&
+            corrupt_blocks.point_count < points_before_compact,
+            "compact_non_empty_blocks guards OOB block index and compacts orphaned points"
+        )) {
+        goto cleanup;
+    }
+
+    const size_t points_before_remove = corrupt_blocks.point_count;
+    if (!assert_condition(
+            remove_color_block_at(&corrupt_blocks, 0U) &&
+            corrupt_blocks.block_count == 1U &&
+            corrupt_blocks.point_count < points_before_remove,
+            "remove_color_block_at compacts orphaned points"
+        )) {
+        goto cleanup;
+    }
+
+    size_t dup_block_zero = 0U;
+    size_t dup_block_one = 0U;
+    size_t dup_block_two = 0U;
+    if (!design_append_block(&duplicate_blocks, janome_palette[10], 10U, true, &dup_block_zero) ||
+        !design_append_block(&duplicate_blocks, janome_palette[12], 12U, true, &dup_block_one) ||
+        !design_append_block(&duplicate_blocks, janome_palette[10], 10U, true, &dup_block_two)) {
+        goto cleanup;
+    }
+    for (size_t item_index = 0U; item_index < 3U; item_index += 1U) {
+        const size_t offset = duplicate_blocks.point_count;
+        const size_t block_target = item_index;
+        if (!design_append_point(&duplicate_blocks, (int32_t)item_index * 20, 0) ||
+            !design_append_point(&duplicate_blocks, (int32_t)item_index * 20 + 18, 18) ||
+            !design_append_chain(&duplicate_blocks, offset, 2U, block_target, false, false)) {
+            goto cleanup;
+        }
+    }
+    /* Append a chain with an out-of-range color_block_index to verify guard. */
+    const size_t bad_offset = duplicate_blocks.point_count;
+    if (!design_append_point(&duplicate_blocks, 100, 100) ||
+        !design_append_point(&duplicate_blocks, 118, 118) ||
+        !design_append_chain(&duplicate_blocks, bad_offset, 2U, 777U, false, false)) {
+        goto cleanup;
+    }
+    const size_t dup_points_before = duplicate_blocks.point_count;
+    if (!assert_condition(
+            merge_duplicate_color_blocks(&duplicate_blocks) &&
+            duplicate_blocks.block_count == 2U &&
+            duplicate_blocks.chain_count == 3U &&
+            duplicate_blocks.point_count < dup_points_before,
+            "merge_duplicate_color_blocks guards OOB block index and compacts points"
+        )) {
+        goto cleanup;
+    }
+
+    /* 4. append_locked_subchain underflow guard & reorder_cutout_chains_by_side zero-point guard. */
+    const StitchPoint single_point[1] = {{10, 20}};
+    if (!assert_condition(
+            !append_locked_subchain(&zero_chain_design, single_point, 0U, 1U, 0U, true, true) &&
+            !append_locked_subchain(&zero_chain_design, single_point, 0U, 0U, 0U, true, true),
+            "append_locked_subchain rejects run_point_count < 2 without underflow"
+        )) {
+        goto cleanup;
+    }
+    if (!design_append_block(&zero_chain_design, janome_palette[10], 10U, true, nullptr) ||
+        !design_append_point(&zero_chain_design, -40, 0) ||
+        !design_append_point(&zero_chain_design, -22, 18) ||
+        !design_append_point(&zero_chain_design, 40, 0) ||
+        !design_append_point(&zero_chain_design, 58, 18) ||
+        !design_append_chain(&zero_chain_design, 0U, 0U, 0U, false, false) ||
+        !design_append_chain(&zero_chain_design, 0U, 2U, 0U, false, false) ||
+        !design_append_chain(&zero_chain_design, 2U, 2U, 0U, false, false)) {
+        goto cleanup;
+    }
+    const CutRectangle center_cut = {-10, -10, 10, 10};
+    if (!assert_condition(
+            reorder_cutout_chains_by_side(&zero_chain_design, center_cut),
+            "reorder_cutout_chains_by_side handles zero-point chain without division by zero"
+        )) {
+        goto cleanup;
+    }
+
+    /* 5. Transactional EditHistory undo/redo round-trip. */
+    history_init(&history);
+    if (!assert_condition(clone_stitch_design(&unsorted, &history_work), "clone initial history state") ||
+        !assert_condition(history_push(&history, &history_work), "push history state 0")) {
+        goto cleanup;
+    }
+    const size_t initial_stitches = compute_design_stats(&history_work).stitch_count;
+    if (!assert_condition(remove_color_block_at(&history_work, 1U), "mutate history state 1") ||
+        !assert_condition(history_push(&history, &history_work), "push history state 1")) {
+        goto cleanup;
+    }
+    const size_t mutated_stitches = compute_design_stats(&history_work).stitch_count;
+    if (!assert_condition(mutated_stitches < initial_stitches, "mutated state has fewer stitches") ||
+        !assert_condition(history_undo(&history, &history_work), "transactional undo succeeds") ||
+        !assert_condition(compute_design_stats(&history_work).stitch_count == initial_stitches, "undo restores exact stitches") ||
+        !assert_condition(!history_undo(&history, &history_work), "undo at index 0 safely returns false") ||
+        !assert_condition(compute_design_stats(&history_work).stitch_count == initial_stitches, "failed undo preserves design") ||
+        !assert_condition(history_redo(&history, &history_work), "transactional redo succeeds") ||
+        !assert_condition(compute_design_stats(&history_work).stitch_count == mutated_stitches, "redo restores mutated stitches")) {
+        goto cleanup;
+    }
+
+    /* 6. delete_masked_segments with real pitch=28 preserves valid 2.8 mm diagonal stitch. */
+    size_t pitch28_block = 0U;
+    if (!design_append_block(&pitch28_source, janome_palette[10], 10U, true, &pitch28_block) ||
+        !design_append_point(&pitch28_source, 0, 0) ||
+        !design_append_point(&pitch28_source, 28, 28) ||
+        !design_append_point(&pitch28_source, 28, 0) ||
+        !design_append_point(&pitch28_source, 0, 28) ||
+        !design_append_chain(&pitch28_source, 0U, 4U, pitch28_block, false, false)) {
+        goto cleanup;
+    }
+    const uint8_t pitch28_mask[3] = {0U, 1U, 1U};
+    if (!assert_condition(
+            delete_masked_segments(&pitch28_source, 28, pitch28_mask, 3U, &pitch28_deleted) &&
+            pitch28_deleted.chain_count == 1U &&
+            compute_design_stats(&pitch28_deleted).stitch_count >= 1U,
+            "delete_masked_segments with pitch=28 preserves single 2.8mm cross diagonal"
+        )) {
+        goto cleanup;
+    }
+
+    /* 7. is_cross_diagonal_for_pitch integer math matches sqrt() reference across pitches 10..50. */
+    for (int32_t pitch = MIN_CROSS_PITCH_UNITS; pitch <= MAX_CROSS_PITCH_UNITS; pitch += 1) {
+        for (int32_t delta_x = 0; delta_x <= pitch + 15; delta_x += 1) {
+            for (int32_t delta_y = delta_x - 4; delta_y <= delta_x + 4; delta_y += 1) {
+                if (delta_y < 0) {
+                    continue;
+                }
+                const StitchPoint start_pt = {0, 0};
+                const StitchPoint end_pt = {delta_x, delta_y};
+                const bool integer_result = is_cross_diagonal_for_pitch(start_pt, end_pt, pitch);
+
+                int32_t axis_diff = delta_x - delta_y;
+                if (axis_diff < 0) {
+                    axis_diff = -axis_diff;
+                }
+                bool float_result = false;
+                if (axis_diff <= 3) {
+                    const double seg_len = sqrt((double)delta_x * (double)delta_x + (double)delta_y * (double)delta_y);
+                    const double exp_diag = (double)pitch * sqrt(2.0);
+                    float_result = (seg_len >= exp_diag * 0.80 - 1e-9 && seg_len <= exp_diag * 1.20 + 1e-9);
+                }
+                if (!assert_condition(
+                        integer_result == float_result,
+                        "is_cross_diagonal_for_pitch integer math matches sqrt reference"
+                    )) {
+                    goto cleanup;
+                }
+            }
+        }
+    }
+    const StitchPoint huge_start = {-50000000, -50000000};
+    const StitchPoint huge_end = {50000000, 50000000};
+    if (!assert_condition(
+            !is_cross_diagonal_for_pitch(huge_start, huge_end, 18),
+            "is_cross_diagonal_for_pitch rejects huge coordinates without overflow"
+        )) {
+        goto cleanup;
+    }
+
+    /* 8. load_embroidery_file rejects directories via fstat + S_ISREG. */
+    if (!assert_condition(
+            !load_embroidery_file("/tmp", &dir_test),
+            "load_embroidery_file rejects non-regular directory path"
+        )) {
+        goto cleanup;
+    }
+
+    printf("[PASS] Stage 1 security & correctness regressions (8/8 checks)\n");
+    passed = true;
+
+cleanup:
+    history_clear(&history);
+    free_stitch_design(&dir_test);
+    free_stitch_design(&history_work);
+    free_stitch_design(&zero_chain_design);
+    free_stitch_design(&pitch28_deleted);
+    free_stitch_design(&pitch28_source);
+    free_stitch_design(&duplicate_blocks);
+    free_stitch_design(&corrupt_blocks);
+    free_stitch_design(&reloaded);
+    free_stitch_design(&unsorted);
+    remove(unsorted_jef_path);
+    return passed;
+}
+
+static size_t count_non_background_pixels(const PixelCanvas *canvas, uint32_t background_pixel) {
+    size_t drawn_pixels = 0U;
+    const size_t total_pixels = (size_t)canvas->width * (size_t)canvas->height;
+    for (size_t pixel_index = 0U; pixel_index < total_pixels; pixel_index += 1U) {
+        if (canvas->pixels[pixel_index] != background_pixel) {
+            drawn_pixels += 1U;
+        }
+    }
+    return drawn_pixels;
+}
+
+static bool test_headless_render_modes(void) {
+    bool passed = false;
+    StitchDesign design = {};
+    PixelCanvas canvas = {};
+    PixelCanvas ui_canvas = {};
+    BlockDedupTable dedup = {};
+    EditorState ui_state = {};
+    uint8_t *keep_mask = nullptr;
+    uint8_t *selection_mask = nullptr;
+    uint8_t *hover_mask = nullptr;
+
+    if (!assert_condition(build_synthetic_cross_grid_design(&design), "build design for headless render")) {
+        goto cleanup;
+    }
+
+    /* Add a non-diagonal contour backstitch chain to test Blocks Pass 2 rendering. */
+    const size_t contour_offset = design.point_count;
+    if (!design_append_point(&design, design.minimum_x, design.minimum_y) ||
+        !design_append_point(&design, design.maximum_x, design.minimum_y) ||
+        !design_append_point(&design, design.maximum_x, design.maximum_y) ||
+        !design_append_chain(&design, contour_offset, 3U, 0U, true, true)) {
+        goto cleanup;
+    }
+    recompute_design_bounds(&design);
+
+    const CrossGridInfo grid = detect_cross_stitch_grid(&design);
+    const size_t total_segments = count_design_segments(&design);
+    keep_mask = (uint8_t *)malloc(total_segments);
+    selection_mask = (uint8_t *)calloc(total_segments, sizeof(uint8_t));
+    hover_mask = (uint8_t *)calloc(total_segments, sizeof(uint8_t));
+    if (!assert_condition(
+            keep_mask != nullptr && selection_mask != nullptr && hover_mask != nullptr,
+            "allocate headless render masks"
+        )) {
+        goto cleanup;
+    }
+    for (size_t segment_index = 0U; segment_index < total_segments; segment_index += 1U) {
+        if ((segment_index % 4U) == 0U) {
+            keep_mask[segment_index] = 0U;
+        } else {
+            keep_mask[segment_index] = 1U;
+        }
+        if (segment_index < 20U) {
+            selection_mask[segment_index] = 1U;
+        } else if (segment_index < 40U) {
+            hover_mask[segment_index] = 1U;
+        }
+    }
+
+    if (!assert_condition(init_pixel_canvas(&canvas, 320, 240), "init 320x240 headless PixelCanvas") ||
+        !assert_condition(init_block_dedup_table(&dedup), "init headless BlockDedupTable")) {
+        goto cleanup;
+    }
+
+    const uint32_t background = pack_rgb_pixel(245U, 246U, 248U);
+    const RenderViewport viewport = {0, 0, canvas.width, canvas.height};
+    const CameraView camera = {
+        .center_x = ((double)design.minimum_x + (double)design.maximum_x) * 0.5,
+        .center_y = ((double)design.minimum_y + (double)design.maximum_y) * 0.5,
+        .pixels_per_unit = 0.85
+    };
+
+    const StitchViewMode modes[3] = {VIEW_MODE_THREAD, VIEW_MODE_BLOCKS, VIEW_MODE_LINE};
+    size_t drawn_counts[3] = {};
+
+    for (size_t mode_index = 0U; mode_index < 3U; mode_index += 1U) {
+        reset_canvas_clip(&canvas);
+        draw_filled_rectangle(&canvas, 0, 0, canvas.width, canvas.height, background);
+
+        DesignRenderParams params = {
+            .viewport = viewport,
+            .camera = camera,
+            .grid = grid,
+            .view_mode = modes[mode_index],
+            .thread_thickness_index = 2U,
+            .show_jumps = true,
+            .show_locks = true,
+            .draw_overlays = true,
+            .world_offset_x = 0,
+            .world_offset_y = 0,
+            .keep_preview_mask = keep_mask,
+            .keep_preview_mask_length = total_segments,
+            .selection_mask = selection_mask,
+            .selection_mask_length = total_segments,
+            .hover_mask = hover_mask,
+            .hover_mask_length = total_segments,
+            .maximum_stitches_to_draw = total_segments / 2U,
+            .block_dedup = &dedup
+        };
+        render_design_chains(&canvas, &design, &params);
+        drawn_counts[mode_index] = count_non_background_pixels(&canvas, background);
+    }
+
+    if (!assert_condition(
+            drawn_counts[0] > 500U && drawn_counts[1] > 500U && drawn_counts[2] > 500U,
+            "headless Thread, Blocks, and Line modes all draw stitch pixels without SDL"
+        )) {
+        goto cleanup;
+    }
+    if (!assert_condition(
+            drawn_counts[0] > drawn_counts[2] && drawn_counts[1] > drawn_counts[2],
+            "Thread and Blocks cover more pixels than 1px Line mode"
+        )) {
+        goto cleanup;
+    }
+
+    /* Exercise full headless UI frame rendering (toolbar, panels, grid, hoop, stitches) without SDL. */
+    if (!assert_condition(init_pixel_canvas(&ui_canvas, 1280, 720), "init 1280x720 headless UI canvas")) {
+        goto cleanup;
+    }
+    init_default_editor_state(&ui_state);
+    if (!assert_condition(clone_stitch_design(&design, &ui_state.design), "clone design into headless EditorState")) {
+        goto cleanup;
+    }
+    ui_state.grid = grid;
+    fit_camera_to_design(&ui_state, ui_canvas.width, ui_canvas.height);
+    render_editor_frame(&ui_canvas, &ui_state);
+    if (!assert_condition(
+            ui_state.toolbar_button_count >= 30U &&
+            hit_test_toolbar(&ui_state, ui_state.toolbar_buttons[0].left_x + 4, ui_state.toolbar_buttons[0].top_y + 4) == COMMAND_OPEN_FILE_DIALOG,
+            "headless render_editor_frame and hit_test_toolbar succeed without SDL"
+        )) {
+        goto cleanup;
+    }
+
+    printf(
+        "[PASS] Headless render (no SDL): Thread=%zu px, Blocks=%zu px, Line=%zu px + UI frame\n",
+        drawn_counts[0],
+        drawn_counts[1],
+        drawn_counts[2]
+    );
+    passed = true;
+
+cleanup:
+    free_editor_state(&ui_state);
+    free_pixel_canvas(&ui_canvas);
+    free_block_dedup_table(&dedup);
+    free_pixel_canvas(&canvas);
+    free(hover_mask);
+    free(selection_mask);
+    free(keep_mask);
+    free_stitch_design(&design);
+    return passed;
+}
+
 int main(void) {
     if (!test_invalid_and_corrupt_inputs()) {
         return EXIT_FAILURE;
@@ -1130,6 +1569,12 @@ int main(void) {
         return EXIT_FAILURE;
     }
     if (!test_draw_x_and_unique_paths()) {
+        return EXIT_FAILURE;
+    }
+    if (!test_stage1_security_and_correctness_regressions()) {
+        return EXIT_FAILURE;
+    }
+    if (!test_headless_render_modes()) {
         return EXIT_FAILURE;
     }
     if (!test_optional_real_directory()) {
